@@ -21,7 +21,9 @@ from gtnh_client.launch import (
     build_command,
     configure_lwjgl3ify,
     install_mods,
+    install_resource_packs,
     mute_sound,
+    restore_resource_packs,
     run_process,
 )
 from gtnh_client.profile import ProfileError
@@ -68,19 +70,33 @@ def run_client(
     timeout: float,
     username: str,
     log: Path | None,
+    extra_mods: list[Path] = (),
+    resource_packs: list[Path] = (),
 ) -> int:
+    """`extra_mods` and `resource_packs` are installed for this run only and removed afterwards (options.txt
+    `resourcePacks` restored), so later default runs are unaffected."""
     if not layout.client_dir.exists():
         prepare(layout, default_zip())
     profile = layout.load_profile()
     ensure_downloads(layout, profile)
     install_mods(layout.minecraft_dir, mods)
-    cfg = configure_lwjgl3ify(layout.minecraft_dir)
-    print(f"[run] {cfg}: window " + ", ".join(f"{k}={str(v).lower()}" for k, v in LWJGL3IFY_WINDOW.items()))
-    print(f"[run] {mute_sound(layout.minecraft_dir)}: {MUTE_OPTION[0]}:{MUTE_OPTION[1]} (muted)")
-    cmd = build_command(layout, profile, xmx=xmx, jvm_args=jvm_args, username=username)
-    log = log or layout.client_dir / "logs-launcher" / f"client-{datetime.now():%Y%m%d-%H%M%S}.log"
-    print(f"[run] log: {log}", flush=True)
-    return run_process(cmd, cwd=layout.minecraft_dir, log_file=log, timeout=timeout)
+    mods_dir = layout.minecraft_dir / "mods"
+    temporary_mods = [mods_dir / jar.name for jar in extra_mods if not (mods_dir / jar.name).exists()]
+    install_mods(layout.minecraft_dir, list(extra_mods))
+    installed_packs, previous_packs = install_resource_packs(layout.minecraft_dir, list(resource_packs))
+    try:
+        cfg = configure_lwjgl3ify(layout.minecraft_dir)
+        print(f"[run] {cfg}: window " + ", ".join(f"{k}={str(v).lower()}" for k, v in LWJGL3IFY_WINDOW.items()))
+        print(f"[run] {mute_sound(layout.minecraft_dir)}: {MUTE_OPTION[0]}:{MUTE_OPTION[1]} (muted)")
+        cmd = build_command(layout, profile, xmx=xmx, jvm_args=jvm_args, username=username)
+        log = log or layout.client_dir / "logs-launcher" / f"client-{datetime.now():%Y%m%d-%H%M%S}.log"
+        print(f"[run] log: {log}", flush=True)
+        return run_process(cmd, cwd=layout.minecraft_dir, log_file=log, timeout=timeout)
+    finally:
+        restore_resource_packs(layout.minecraft_dir, installed_packs, previous_packs)
+        for jar in temporary_mods:
+            jar.unlink(missing_ok=True)
+            print(f"[run] removed extra mod {jar}")
 
 
 def mise_where(tool: str) -> str:
@@ -139,6 +155,9 @@ def cmd_export(args: argparse.Namespace) -> int:
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     jvm_args = [f"-Dbluemap.gtnh.exporter.out={out}"]
+    if args.pack_suffix:
+        jvm_args.append(f"-Dbluemap.gtnh.exporter.packSuffix={args.pack_suffix}")
+    zip_name = RESOURCES_ZIP if not args.pack_suffix else RESOURCES_ZIP.removesuffix(".zip") + f"-{args.pack_suffix}.zip"
     extra_files = [args.extra_states.resolve()] if args.extra_states else []
     if args.extra_states_dump:
         scanned = out / "extra-states.txt"
@@ -151,7 +170,8 @@ def cmd_export(args: argparse.Namespace) -> int:
             merged.write_text("".join(f.read_text() for f in extra_files))
         jvm_args.append(f"-Dbluemap.gtnh.exporter.extraStates={merged}")
     code = run_client(
-        layout, mods=[mod_jar], jvm_args=jvm_args, xmx="10G", timeout=1800, username="BlueMapExporter", log=None
+        layout, mods=[mod_jar], jvm_args=jvm_args, xmx="10G", timeout=1800, username="BlueMapExporter", log=None,
+        extra_mods=[p.resolve() for p in args.extra_mod], resource_packs=[p.resolve() for p in args.resource_pack],
     )
     t_run = time.monotonic()
     split = (
@@ -161,7 +181,7 @@ def cmd_export(args: argparse.Namespace) -> int:
         print(f"[export] FAILED: client exited with {code} after {t_run - t0:.0f}s ({split})", file=sys.stderr)
         return code
     problems = []
-    for name in (EXPORT_REPORT, RESOURCES_ZIP):
+    for name in (EXPORT_REPORT, zip_name):
         path = out / name
         if not path.is_file():
             problems.append(f"{path} missing")
@@ -218,6 +238,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", type=Path, default=ws / "out" / "exporter", help="export output directory (default %(default)s)")
     p.add_argument("--extra-states", type=Path, help="extra block states file passed to the exporter ('<modid:name> <meta>' lines)")
     p.add_argument("--extra-states-dump", type=Path, action="append", default=[], help="bmh dump.ndjson (world scan) whose non-vanilla states are exported too; repeatable")
+    p.add_argument("--resource-pack", type=Path, action="append", default=[], help="client resource pack (zip or dir) enabled for this export only, first = highest priority; repeatable")
+    p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this export only; repeatable")
+    p.add_argument("--pack-suffix", help="output pack name suffix: bluemap-gtnh-resources-<version>-<suffix>.zip")
     p.set_defaults(func=cmd_export)
 
     def coverage_args(p: argparse.ArgumentParser) -> None:

@@ -13,7 +13,9 @@ class Exporter(private val mc: Minecraft, private val outDir: File, private val 
     fun run() {
         val started = System.nanoTime()
         outDir.mkdirs()
-        val zip = File(outDir, "bluemap-gtnh-resources-$PACK_VERSION.zip")
+        // `-Dbluemap.gtnh.exporter.packSuffix=modernity` -> bluemap-gtnh-resources-<version>-modernity.zip
+        val suffix = System.getProperty("bluemap.gtnh.exporter.packSuffix")?.takeIf { it.isNotBlank() }?.let { "-$it" } ?: ""
+        val zip = File(outDir, "bluemap-gtnh-resources-$PACK_VERSION$suffix.zip")
         val partial = File(outDir, zip.name + ".part")
         val extraStates = BlockExporter.parseExtraStates(extraStatesFile)
         ExporterMod.log.info("Exporting to {} ({} extra states)", zip, extraStates.values.sumOf { it.size })

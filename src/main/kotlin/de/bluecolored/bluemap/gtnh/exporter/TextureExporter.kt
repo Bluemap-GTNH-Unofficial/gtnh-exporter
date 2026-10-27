@@ -52,11 +52,12 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
     fun export(icon: IIcon?): String? {
         if (icon == null) return null
         val name = icon.iconName ?: return null
+        if (isErrorIcon(name)) return null
         val sprite = sprites[name] ?: (icon as? TextureAtlasSprite)
         return export(name, sprite)
     }
 
-    fun export(iconName: String): String? = export(iconName, sprites[iconName])
+    fun export(iconName: String): String? = if (isErrorIcon(iconName)) null else export(iconName, sprites[iconName])
 
     private fun export(name: String, sprite: TextureAtlasSprite?): String? {
         // failed icons are cached as null too
@@ -94,9 +95,10 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
                 } catch (_: IOException) {
                     null
                 }
-                if (mcmeta != null) {
+                val animation = mcmeta?.let(::sanitizeMcmeta)
+                if (animation != null) {
                     pack.png(path, image)
-                    pack.bytes("$path.mcmeta", mcmeta)
+                    pack.bytes("$path.mcmeta", animation)
                 } else if (image.height > image.width && image.height % image.width == 0) {
                     pack.png(path, image.getSubimage(0, 0, image.width, image.width))
                 } else {
@@ -156,6 +158,47 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
         GL11.glGetTexImage(GL11.GL_TEXTURE_2D, 0, GL12.GL_BGRA, GL12.GL_UNSIGNED_INT_8_8_8_8_REV, buffer)
         atlasWidth = width
         return buffer
+    }
+
+    companion object {
+        /**
+         * Placeholders the client substitutes for icons that do not exist: vanilla `missingno`, Forge's
+         * `MISSING_ICON_BLOCK_<id>_<name>` and Angelica's `error_block_<n>` (returned instead of a null icon).
+         * Exporting them would paint whole blocks magenta/black or with Angelica's red face.
+         */
+        fun isErrorIcon(name: String?): Boolean {
+            if (name == null) return true
+            val path = name.substringAfter(':')
+            return path == "missingno" || path.startsWith("MISSING_ICON_") ||
+                (name.startsWith("angelica:") && path.startsWith("error_block"))
+        }
+
+        /**
+         * Re-serializes a 1.7 `.mcmeta` leniently (some mods ship trailing commas, which 1.7's Gson tolerated but
+         * BlueMap's strict parser does not, dropping the whole texture); array holes become nothing.
+         * Returns null if it cannot be read or has no `animation` section.
+         */
+        fun sanitizeMcmeta(bytes: ByteArray): ByteArray? {
+            val json = try {
+                val reader = com.google.gson.stream.JsonReader(java.io.StringReader(String(bytes, Charsets.UTF_8)))
+                reader.isLenient = true
+                com.google.gson.internal.Streams.parse(reader)
+            } catch (_: Exception) {
+                return null
+            }
+            if (!json.isJsonObject || !json.asJsonObject.has("animation")) return null
+            return PackWriter.GSON.toJson(dropNulls(json)).toByteArray(Charsets.UTF_8)
+        }
+
+        private fun dropNulls(element: com.google.gson.JsonElement): com.google.gson.JsonElement = when {
+            element.isJsonArray -> com.google.gson.JsonArray().also { out ->
+                element.asJsonArray.filterNot { it.isJsonNull }.forEach { out.add(dropNulls(it)) }
+            }
+            element.isJsonObject -> com.google.gson.JsonObject().also { out ->
+                element.asJsonObject.entrySet().forEach { (k, v) -> if (!v.isJsonNull) out.add(k, dropNulls(v)) }
+            }
+            else -> element
+        }
     }
 
     /** Uniform grid over atlas uv space for sprite lookup by uv. */

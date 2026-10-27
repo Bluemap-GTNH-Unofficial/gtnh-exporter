@@ -29,7 +29,20 @@ Build alone: `mise exec java@temurin-25.0.5+8.0.LTS -- ./gradlew -Porg.gradle.ja
 
 System properties (the launcher sets them): `bluemap.gtnh.exporter.out` (output dir), `bluemap.gtnh.exporter.extraStates`
 (file of `<modid:name> <meta>` lines, e.g. from world scans; the meta is the last token), `bluemap.gtnh.exporter.stay=true`
-(keep the client open), `bluemap.gtnh.exporter.skipBlocks=true` (GregTech dump only).
+(keep the client open), `bluemap.gtnh.exporter.skipBlocks=true` (GregTech dump only), `bluemap.gtnh.exporter.packSuffix=<s>`
+(output `bluemap-gtnh-resources-2.9.0-RC-2-<s>.zip`).
+
+Alternative textures (Phase 6): `export --resource-pack <zip|dir> [--extra-mod <jar>] --pack-suffix <s> --out <dir>`
+enables the packs (first = highest priority) and mods for that run only; `mods/` and `options.txt` `resourcePacks` are
+restored afterwards. Example: `--resource-pack ../../../../downloads/modernity/Modernity-2.9.x-fa35a3d.zip --extra-mod
+../../../../downloads/modernity/MyCTMLib-1.4.3-29x.jar --pack-suffix modernity --out ../../../../out/modernity`.
+
+Placeholder icons (`missingno`, Forge `MISSING_ICON_BLOCK_*`, Angelica `error_block_*`, which Angelica returns instead of
+null icons) count as missing: probed metas with only placeholders are dropped, cubes need real icons, and a capture that
+contains a placeholder sprite (e.g. Chisel's CTM renderer in the empty fake world) is replaced by the block's own icons on
+its bounds (bounding-box fallback, result `bbox` with `fallbackFor: error_icon`). GregTech machines, ores 2..7 and frames
+get `"renderer": "gtnh:gt_machine" / "gtnh:gt_ore" / "gtnh:gt_frame"` on every variant (Phase 4 renderers in
+`gtnh-render`), failed metas included with model `bluemap:block/missing`.
 
 ## What is exported
 
@@ -57,7 +70,12 @@ for quads lying on a block face and facing out.
 
 **Textures** `assets/<ns>/textures/block/<N(path segments)>.png`, `ns` = N(icon domain), vanilla icons under
 `gtnh_minecraft_1_7` (not to clash with 1.13 textures). Source: the PNG through the resource manager (`.png.mcmeta`
-copied; strips without one are cut to the first frame), else the sprite's frame data, else a crop of the GL atlas.
+re-serialized leniently — some mods ship trailing commas, which BlueMap's parser rejects together with the texture;
+strips without one are cut to the first frame), else the sprite's frame data, else a crop of the GL atlas.
+
+In BlueMap, `gtnh-render` maps modded ids that have no blockstate file to `bluemap:missing` (missing-model cube, a full
+cube, so culling its neighbours is correct) instead of drawing nothing; ids with a blockstate but no variant for a meta
+use BlueMap's first-variant fallback (meta 0 is always written first).
 
 **Colors** `assets/<ns>/blockColors.json`: `colorMultiplier` probed in 7 vanilla biomes; equal to the biome's grass /
 foliage / water color everywhere → `@grass` / `@foliage` / `@water`; constant non-white → `#rrggbb`; biome-dependent

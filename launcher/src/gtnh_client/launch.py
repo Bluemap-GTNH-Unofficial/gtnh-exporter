@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -82,6 +83,46 @@ def install_mods(minecraft_dir: Path, jars: list[Path]) -> None:
         if target.resolve() != jar.resolve():
             shutil.copy2(jar, target)
         print(f"[run] installed mod {target}")
+
+
+def install_resource_packs(minecraft_dir: Path, packs: list[Path]) -> tuple[list[Path], str | None]:
+    """Copies zip/dir resource packs into `resourcepacks/` and enables exactly them, in the given order (first = top
+    priority; the 1.7 options list is ordered bottom to top, so it is written reversed). Returns the copied paths and
+    the previous `resourcePacks:` options line (None if absent) for [restore_resource_packs]."""
+    target_dir = minecraft_dir / "resourcepacks"
+    target_dir.mkdir(exist_ok=True)
+    installed = []
+    for pack in packs:
+        if not pack.exists():
+            raise FileNotFoundError(f"resource pack {pack} does not exist")
+        target = target_dir / pack.name
+        if target.exists():
+            shutil.rmtree(target) if target.is_dir() else target.unlink()
+        shutil.copytree(pack, target) if pack.is_dir() else shutil.copy2(pack, target)
+        installed.append(target)
+        print(f"[run] installed resource pack {target}")
+    options = minecraft_dir / "options.txt"
+    lines = options.read_text().splitlines() if options.is_file() else []
+    previous = next((line for line in lines if line.startswith("resourcePacks:")), None)
+    if packs:
+        names = json.dumps([p.name for p in reversed(packs)])
+        lines = [line for line in lines if not line.startswith("resourcePacks:")] + [f"resourcePacks:{names}"]
+        options.write_text("\n".join(lines) + "\n")
+    return installed, previous
+
+
+def restore_resource_packs(minecraft_dir: Path, installed: list[Path], previous: str | None) -> None:
+    """Undoes [install_resource_packs]: deletes the copies and restores the previous `resourcePacks:` line."""
+    if not installed:
+        return
+    for path in installed:
+        shutil.rmtree(path) if path.is_dir() else path.unlink(missing_ok=True)
+    options = minecraft_dir / "options.txt"
+    lines = [line for line in options.read_text().splitlines() if not line.startswith("resourcePacks:")]
+    if previous is not None:
+        lines.append(previous)
+    options.write_text("\n".join(lines) + "\n")
+    print(f"[run] removed {len(installed)} resource pack(s), options.txt resourcePacks restored")
 
 
 def build_command(

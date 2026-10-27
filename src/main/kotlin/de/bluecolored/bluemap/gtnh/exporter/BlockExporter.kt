@@ -202,6 +202,8 @@ class BlockExporter(
         val models = HashMap<String, String>() // content signature -> model key
         val metas = metasOf(name, block)
         val explicitMetas = HashSet<Int>().also { set -> extraStates[name]?.let(set::addAll) }
+        // failed metas that exist in worlds (0..15 or listed as extra states), for RENDERER_OVERRIDES blocks
+        val failedInWorld = java.util.TreeSet<Int>()
 
         for (meta in metas) {
             val metaInfo = JsonObject().apply { addProperty("meta", meta) }
@@ -217,7 +219,9 @@ class BlockExporter(
                 }
                 is StateResult.Model -> {
                     variants[meta] = JsonObject().apply {
-                        if (result.quads) addProperty("renderer", "gtnh:quads")
+                        val override = RENDERER_OVERRIDES[name]
+                        if (override != null) addProperty("renderer", override)
+                        else if (result.quads) addProperty("renderer", "gtnh:quads")
                         addProperty("model", result.model)
                     }
                     if (result.quads) stats.quads++ else stats.cube++
@@ -234,6 +238,7 @@ class BlockExporter(
                     stats.failedStates.add("$name:$meta ${result.reason}")
                     metaInfo.addProperty("result", "failed")
                     metaInfo.addProperty("reason", result.reason)
+                    if (meta <= 15 || meta in explicitMetas) failedInWorld.add(meta)
                 }
             }
             stats.states++
@@ -243,6 +248,17 @@ class BlockExporter(
         blocksNdjson.append(PackWriter.GSON.toJson(info)).append('\n')
         addShapes("$namespace:$value")
 
+        // blocks drawn by a dedicated renderer (GregTech, Phase 4) get a variant for every meta, even those whose
+        // static appearance failed: the renderer draws from tile-entity/meta data and only falls back to the model
+        RENDERER_OVERRIDES[name]?.let { renderer ->
+            for (meta in failedInWorld) {
+                if (meta in variants) continue
+                variants[meta] = JsonObject().apply {
+                    addProperty("renderer", renderer)
+                    addProperty("model", "bluemap:block/missing")
+                }
+            }
+        }
         if (variants.isNotEmpty()) {
             val variantsJson = JsonObject()
             // the first variant is BlueMap's fallback for metas without a variant
@@ -280,7 +296,7 @@ class BlockExporter(
         info: JsonObject,
         probed: Boolean,
     ): StateResult {
-        val itemIcons = (0 until 6).map { side -> safe { block.getIcon(side, meta) } }
+        val itemIcons = (0 until 6).map { side -> safe { block.getIcon(side, meta) }?.takeUnless { TextureExporter.isErrorIcon(it.iconName) } }
         if (probed && meta != 0 && itemIcons.all { it == null } && renderType == 0) return StateResult.Invalid
 
         val tileEntity = if (safe { block.hasTileEntity(meta) } == true) {
@@ -313,7 +329,7 @@ class BlockExporter(
         blockShapes[meta] = shapeOf(block)
 
         val worldIcons = (0 until 6).map { side ->
-            safe { block.getIcon(world, FakeWorld.X, FakeWorld.Y, FakeWorld.Z, side) } ?: itemIcons[side]
+            safe { block.getIcon(world, FakeWorld.X, FakeWorld.Y, FakeWorld.Z, side) }?.takeUnless { TextureExporter.isErrorIcon(it.iconName) } ?: itemIcons[side]
         }
         info.add("icons", JsonArray().also { a -> worldIcons.forEach { a.addString(it?.iconName) } })
         safe { block.getRenderColor(meta) }?.let { info.addProperty("renderColor", String.format("#%06x", it and 0xFFFFFF)) }
@@ -439,13 +455,18 @@ class BlockExporter(
         val quadsJson = JsonArray()
         var anyTint = false
         val light = block.lightValue
+        var errorQuads = 0
         for (quad in captured) {
             val sprite = textures.spriteAt(quad.uc, quad.vc)
             if (sprite == null) {
                 unmappedQuads++
                 continue
             }
-            val texture = textures.export(sprite) ?: continue
+            val texture = textures.export(sprite)
+            if (texture == null) {
+                errorQuads++
+                continue
+            }
             val t = textureIndex.getOrPut(texture) { textureIndex.size }
             val du = sprite.maxU - sprite.minU
             val dv = sprite.maxV - sprite.minV
@@ -489,7 +510,11 @@ class BlockExporter(
                 },
             )
         }
-        if (quadsJson.size() == 0) return StateResult.Failed("unmapped_uv")
+        // a capture with placeholder sprites is broken as a whole (partially drawn CTM, missing overlays)
+        if (quadsJson.size() == 0 || errorQuads > 0) {
+            if (probedMeta) return StateResult.Invalid
+            return StateResult.Failed(if (errorQuads > 0) "error_icon" else "unmapped_uv")
+        }
 
         val texturesJson = JsonObject()
         for ((key, index) in textureIndex) texturesJson.addProperty("t$index", key)
@@ -601,9 +626,18 @@ class BlockExporter(
 
     companion object {
         private val SIDES = arrayOf("down", "up", "north", "south", "west", "east")
+
+        /** Blocks drawn by a dedicated BlueMap renderer from `gtnh-render` (GregTech, Phase 4). */
+        private val RENDERER_OVERRIDES: Map<String, String> = buildMap {
+            put("gregtech:gt.blockmachines", "gtnh:gt_machine")
+            put("gregtech:gt.blockframes", "gtnh:gt_frame")
+            for (i in 2..7) put("gregtech:gt.blockores$i", "gtnh:gt_ore")
+        }
         private val SIDE_AXIS = intArrayOf(1, 1, 2, 2, 0, 0)
         private val FULL_BOUNDS = doubleArrayOf(0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
-        private val BBOX_FALLBACK_REASONS = setOf("tesr_only", "invisible", "no_geometry")
+        // error_icon: the renderer drew placeholder sprites in the fake world (e.g. Chisel's CTM renderer); the
+        // block's own icons on its bounds are the base-tile fallback the plan prescribes for CTM
+        private val BBOX_FALLBACK_REASONS = setOf("tesr_only", "invisible", "no_geometry", "error_icon")
         private val SHADE = floatArrayOf(0.5f, 1f, 0.8f, 0.8f, 0.6f, 0.6f)
         private const val MAX_LISTED_FAILURES = 200
 
