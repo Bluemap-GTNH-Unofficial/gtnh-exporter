@@ -1,0 +1,21 @@
+{
+	"modListVersion": 2,
+	"modList": [{
+		"modid": "${modId}",
+		"name": "${modName}",
+		"description": "Client-side one-shot exporter: writes a BlueMap resource pack of all modded blocks once resources are loaded, then quits the game.",
+		"version": "${modVersion}",
+		"mcversion": "${minecraftVersion}",
+		"url": "",
+		"updateUrl": "",
+		"authorList": ["FYWinds"],
+		"credits": "",
+		"logoFile": "",
+		"screenshots": [],
+		"parent": "",
+		"requiredMods": ["forgelin", "gtnhlib"],
+		"dependencies": ["forgelin", "gtnhlib"],
+		"dependants": [],
+		"useDependencyInformation": false
+	}]
+}

@@ -1,0 +1,16 @@
+/*
+ * Versions match the GT New Horizons 2.9.0-RC-2 pack. Nothing is shaded; every dependency is provided by the pack.
+ */
+dependencies {
+    // Kotlin runtime (stdlib 2.1.10, not relocated) comes from Forgelin.
+    devOnlyNonPublishable("com.github.GTNewHorizons:Forgelin:2.0.3-GTNH:dev")
+    compileOnly("org.jetbrains.kotlin:kotlin-stdlib:2.1.10")
+
+    // Quad capture (TessellatorManager) and GregTech texture data (GtDump).
+    devOnlyNonPublishable("com.github.GTNewHorizons:GTNHLib:0.11.52:dev")
+    devOnlyNonPublishable("com.github.GTNewHorizons:GT5-Unofficial:5.09.54.205:dev")
+
+    // 16-bit metadata and extended block IDs at runtime (dev runs only; no compile-time API use).
+    runtimeOnlyNonPublishable("com.falsepattern:chunkapi-mc1.7.10:0.8.4:dev")
+    runtimeOnlyNonPublishable("com.falsepattern:endlessids-mc1.7.10:1.7.4:dev")
+}

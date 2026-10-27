@@ -1,0 +1,22 @@
+[project]
+name = "gtnh-client"
+version = "0.1.0"
+description = "Prism-free launcher for the GT New Horizons 2.9.0-RC-2 client (macOS arm64) and the BlueMap GTNH exporter pipeline."
+requires-python = ">=3.12"
+dependencies = []
+
+[project.scripts]
+gtnh-client = "gtnh_client.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gtnh_client"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
