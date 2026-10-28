@@ -202,9 +202,9 @@ def run_process(cmd: list[str], *, cwd: Path, log_file: Path, timeout: float) ->
         assert proc.stdout is not None
 
         def pump() -> None:
+            console: dict = {}
             for line in proc.stdout:
-                sys.stdout.buffer.write(line)
-                sys.stdout.buffer.flush()
+                _console_write(line, console)
                 log.write(line)
                 log.flush()
 
@@ -224,3 +224,15 @@ def run_process(cmd: list[str], *, cwd: Path, log_file: Path, timeout: float) ->
         reader.join(timeout=10)
         log.write(f"# exit {code} after {time.monotonic() - start:.1f}s\n".encode())
     return code
+
+
+def _console_write(line: bytes, state: dict) -> None:
+    """Writes to the console until it fails (e.g. `| head` closed the pipe); afterwards only the log is written,
+    so the client never blocks on a full stdout pipe."""
+    if state.get("closed"):
+        return
+    try:
+        sys.stdout.buffer.write(line)
+        sys.stdout.buffer.flush()
+    except (BrokenPipeError, OSError, ValueError):
+        state["closed"] = True

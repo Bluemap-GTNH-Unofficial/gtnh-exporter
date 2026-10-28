@@ -36,9 +36,32 @@ class Exporter(private val mc: Minecraft, private val outDir: File, private val 
             )
 
             val textures = TextureExporter(mc, pack)
-            val blocks = BlockExporter(mc, pack, textures, extraStates)
+            val modData = ModData(mc, pack, textures)
+            val blocks = BlockExporter(mc, pack, textures, extraStates, modData)
             // debugging aid for the GregTech dump: `-Dbluemap.gtnh.exporter.skipBlocks=true`
             if (System.getProperty("bluemap.gtnh.exporter.skipBlocks") != "true") blocks.exportAll()
+            modData.writeChisel()
+            pack.json(
+                "gtnh/mods/myctmlib.json",
+                JsonObject().apply {
+                    addProperty("format", 1)
+                    add("textures", JsonObject().also { o -> textures.myCtm.forEach { (k, v) -> o.add(k, v) } })
+                },
+            )
+            val modAssets = try {
+                modData.copyAssets()
+            } catch (t: Throwable) {
+                ExporterMod.log.error("Copying mod assets failed", t)
+                -1
+            }
+            report.add(
+                "modData",
+                JsonObject().apply {
+                    addProperty("chiselStates", modData.chiselStates)
+                    addProperty("myctmlibTextures", textures.myCtm.size)
+                    addProperty("assets", modAssets)
+                },
+            )
             val blocksDone = System.nanoTime()
             ExporterMod.log.info("Blocks exported in {} s", (blocksDone - started) / 1_000_000_000.0)
 

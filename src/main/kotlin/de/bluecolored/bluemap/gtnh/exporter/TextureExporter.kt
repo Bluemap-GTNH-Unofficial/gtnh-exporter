@@ -29,6 +29,12 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
     val sourceCounts = java.util.EnumMap<Source, Int>(Source::class.java)
     val failures = ArrayList<String>()
 
+    /** MyCTMLib connected textures (`myctmlib` section of a texture's `.mcmeta`, e.g. from Modernity-GTNH), by texture key. */
+    val myCtm = java.util.TreeMap<String, com.google.gson.JsonObject>()
+
+    /** Connected-texture sheets: tall or wide images that are not animation strips. */
+    private val ctmSheets = HashSet<String>()
+
     /** All uploaded block sprites by icon name. */
     val sprites: Map<String, TextureAtlasSprite> = run {
         @Suppress("UNCHECKED_CAST")
@@ -95,11 +101,12 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
                 } catch (_: IOException) {
                     null
                 }
+                mcmeta?.let { recordCtm(name, it) }
                 val animation = mcmeta?.let(::sanitizeMcmeta)
                 if (animation != null) {
                     pack.png(path, image)
                     pack.bytes("$path.mcmeta", animation)
-                } else if (image.height > image.width && image.height % image.width == 0) {
+                } else if (name !in ctmSheets && image.height > image.width && image.height % image.width == 0) {
                     pack.png(path, image.getSubimage(0, 0, image.width, image.width))
                 } else {
                     pack.png(path, image)
@@ -148,6 +155,41 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
         return image
     }
 
+    /**
+     * Records the `myctmlib` section of a 1.7 `.mcmeta` (MyCTMLib connected textures): the referenced `connection` and
+     * `alt` sheets and `equivalents` are exported as textures and replaced by their texture keys; other fields are copied.
+     * `method` defaults to `compact` (MyCTMLib's default).
+     */
+    private fun recordCtm(iconName: String, bytes: ByteArray) {
+        val section = try {
+            val reader = com.google.gson.stream.JsonReader(java.io.StringReader(String(bytes, Charsets.UTF_8)))
+            reader.isLenient = true
+            com.google.gson.internal.Streams.parse(reader).asJsonObject.getAsJsonObject("myctmlib")
+        } catch (_: Exception) {
+            null
+        } ?: return
+        val (namespace, value) = PackKeys.textureKey(iconName)
+        val entry = com.google.gson.JsonObject()
+        entry.addProperty("method", section.get("method")?.takeIf { it.isJsonPrimitive }?.asString ?: "compact")
+        for ((k, v) in section.entrySet()) {
+            when (k) {
+                "method" -> {}
+                "connection", "alt" -> v.takeIf { it.isJsonPrimitive }?.asString?.let { sheet ->
+                    ctmSheets.add(sheet)
+                    export(sheet)
+                }?.let { entry.addProperty(k, it) }
+                "equivalents" -> if (v.isJsonArray) {
+                    val keys = com.google.gson.JsonArray()
+                    v.asJsonArray.filter { it.isJsonPrimitive }.mapNotNull { export(it.asString) }.forEach(keys::addString)
+                    entry.add(k, keys)
+                }
+                else -> entry.add(k, v)
+            }
+        }
+        if (!entry.has("connection")) failures.add("$iconName: myctmlib connection sheet not found")
+        myCtm["$namespace:$value"] = entry
+    }
+
     private fun readAtlas(): IntBuffer {
         GL11.glBindTexture(GL11.GL_TEXTURE_2D, atlas.glTextureId)
         val width = GL11.glGetTexLevelParameteri(GL11.GL_TEXTURE_2D, 0, GL11.GL_TEXTURE_WIDTH)
@@ -161,6 +203,9 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
     }
 
     companion object {
+        /** Angelica/MCPatcher connected-texture tiles (`<domain>:mcpatcher/ctm/<set>/<n>.png`), chosen by neighbours. */
+        fun isCtmTile(name: String?): Boolean = name != null && name.substringAfter(':').startsWith("mcpatcher/ctm/")
+
         /**
          * Placeholders the client substitutes for icons that do not exist: vanilla `missingno`, Forge's
          * `MISSING_ICON_BLOCK_<id>_<name>` and Angelica's `error_block_<n>` (returned instead of a null icon).

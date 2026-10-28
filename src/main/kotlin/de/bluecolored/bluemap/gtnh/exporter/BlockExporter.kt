@@ -35,6 +35,7 @@ class BlockExporter(
     private val pack: PackWriter,
     private val textures: TextureExporter,
     private val extraStates: Map<String, Set<Int>>,
+    private val modData: ModData,
 ) {
     private val world = FakeWorld.create()
     private val renderBlocks = RenderBlocks(world)
@@ -70,6 +71,8 @@ class BlockExporter(
     private val blocksNdjson = StringBuilder()
     private val shapes = JsonObject() // "<ns>:<value>" -> {"*": shape, "<meta>": shape}
     private val blockShapes = HashMap<Int, JsonObject>() // meta -> shape of the block being exported
+    private val blockBounds = HashMap<Int, DoubleArray>() // meta -> bounds of the block being exported
+    private val modelTextures = HashMap<String, Collection<String>>() // model key -> texture keys it uses
 
     var unmappedQuads = 0
         private set
@@ -219,9 +222,7 @@ class BlockExporter(
                 }
                 is StateResult.Model -> {
                     variants[meta] = JsonObject().apply {
-                        val override = RENDERER_OVERRIDES[name]
-                        if (override != null) addProperty("renderer", override)
-                        else if (result.quads) addProperty("renderer", "gtnh:quads")
+                        if (result.quads) addProperty("renderer", "gtnh:quads")
                         addProperty("model", result.model)
                     }
                     if (result.quads) stats.quads++ else stats.cube++
@@ -248,15 +249,33 @@ class BlockExporter(
         blocksNdjson.append(PackWriter.GSON.toJson(info)).append('\n')
         addShapes("$namespace:$value")
 
-        // blocks drawn by a dedicated renderer (GregTech, Phase 4) get a variant for every meta, even those whose
-        // static appearance failed: the renderer draws from tile-entity/meta data and only falls back to the model
-        RENDERER_OVERRIDES[name]?.let { renderer ->
-            for (meta in failedInWorld) {
-                if (meta in variants) continue
-                variants[meta] = JsonObject().apply {
-                    addProperty("renderer", renderer)
-                    addProperty("model", "bluemap:block/missing")
-                }
+        // blocks drawn by a dedicated renderer (GregTech, Phase 4; mod renderers in gtnh-render `render/mods`) get a
+        // variant for every meta, even those whose static appearance failed: the renderer draws from tile-entity/meta
+        // data and only falls back to the model
+        // full cube = drawn by Chisel's CTM renderer on full bounds (stairs, glow, eldritch, waterstone use other
+        // render types and keep their captured quads)
+        val ctmRenderType = block.renderType == ModData.chiselCtmRenderId()
+        val chisel = modData.chisel(block, (variants.keys + failedInWorld).toSortedSet()) { meta ->
+            ctmRenderType && blockBounds[meta]?.contentEquals(FULL_BOUNDS) == true
+        }
+        modData.addChisel("$namespace:$value", chisel)
+        val blockRenderer = RENDERER_OVERRIDES[name] ?: ModData.rendererFor(name)
+        for (meta in (variants.keys + failedInWorld).toSortedSet()) {
+            val renderer = blockRenderer
+                ?: (if (chisel[meta]?.get("fullCube")?.asBoolean == true) "gtnh:chisel_ctm" else null)
+                ?: continue
+            val variant = variants.getOrPut(meta) { JsonObject().apply { addProperty("model", "bluemap:block/missing") } }
+            variant.addProperty("renderer", renderer)
+        }
+        blockBounds.clear()
+        // MyCTMLib connected textures (Modernity): `gtnh:ctm` on variants that use such a texture and have no
+        // dedicated renderer (captured quads included; the model stays the fallback)
+        if (textures.myCtm.isNotEmpty()) {
+            for (variant in variants.values) {
+                val renderer = variant.get("renderer")?.asString
+                if (renderer != null && renderer != "gtnh:quads") continue
+                val used = modelTextures[variant.get("model").asString] ?: continue
+                if (used.any { it in textures.myCtm }) variant.addProperty("renderer", "gtnh:ctm")
             }
         }
         if (variants.isNotEmpty()) {
@@ -327,9 +346,13 @@ class BlockExporter(
         )
         info.add("bounds", JsonArray().also { a -> bounds.forEach { a.addNumber(it) } })
         blockShapes[meta] = shapeOf(block)
+        blockBounds[meta] = bounds
 
+        // connected-texture tiles (Angelica/MCPatcher `mcpatcher/ctm/...`) depend on neighbours: use the base icon
         val worldIcons = (0 until 6).map { side ->
-            safe { block.getIcon(world, FakeWorld.X, FakeWorld.Y, FakeWorld.Z, side) }?.takeUnless { TextureExporter.isErrorIcon(it.iconName) } ?: itemIcons[side]
+            val icon = safe { block.getIcon(world, FakeWorld.X, FakeWorld.Y, FakeWorld.Z, side) }
+                ?.takeUnless { TextureExporter.isErrorIcon(it.iconName) }
+            if (icon == null || (TextureExporter.isCtmTile(icon.iconName) && itemIcons[side] != null)) itemIcons[side] else icon
         }
         info.add("icons", JsonArray().also { a -> worldIcons.forEach { a.addString(it?.iconName) } })
         safe { block.getRenderColor(meta) }?.let { info.addProperty("renderColor", String.format("#%06x", it and 0xFFFFFF)) }
@@ -419,6 +442,7 @@ class BlockExporter(
                 add("elements", JsonArray().also { it.add(element) })
             }
             pack.json(modelPath(key), json)
+            modelTextures[key] = textureKeys.filterNotNull()
             key
         }
         return StateResult.Model(model, quads = false, color = colorConfig(tint), bbox = bbox)
@@ -462,7 +486,7 @@ class BlockExporter(
                 unmappedQuads++
                 continue
             }
-            val texture = textures.export(sprite)
+            val texture = if (TextureExporter.isCtmTile(sprite.iconName)) null else textures.export(sprite)
             if (texture == null) {
                 errorQuads++
                 continue
@@ -526,6 +550,7 @@ class BlockExporter(
         val model = models.getOrPut(signature) {
             val key = "$namespace:gtnh_quads/$value/${models.size}"
             pack.json(modelPath(key), json)
+            modelTextures[key] = textureIndex.keys.toList()
             key
         }
         val color = if (anyTint) (tint as Tint.Biome).calculator else null
