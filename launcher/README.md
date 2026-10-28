@@ -4,11 +4,13 @@ Launches the GT New Horizons 2.9.0-RC-2 **client** (Minecraft 1.7.10, lwjgl3ify,
 without Prism Launcher, using plain `java` from `mise exec java@temurin-25.0.5+8.0.LTS`. It also drives
 the one-shot BlueMap resource export pipeline with the `bluemap-gtnh-exporter` client mod.
 
-Python ≥ 3.12, stdlib only. Paths default relative to the workspace (`WS`, the directory containing
-`BlueMap-GTNH/`; override with `BMGTNH_WORKSPACE`).
+Python ≥ 3.12, stdlib only. Paths default relative to the workspace (`WS`, the directory containing this
+`gtnh-exporter/` checkout and its siblings such as `BlueMap/`; override with `BMGTNH_WORKSPACE`). Installed from the
+release wheel instead of run from a checkout, `WS` is the current directory unless `BMGTNH_WORKSPACE` is set, and
+`export` needs `--mod-jar`.
 
 ```sh
-cd BlueMap-GTNH/tools/gtnh-exporter/launcher
+cd gtnh-exporter/launcher
 uv run gtnh-client prepare --clean
 uv run gtnh-client run --timeout 600
 uv run gtnh-client export
@@ -98,7 +100,7 @@ Values that start with `-` work as `--jvm-arg -Dfoo=bar` as well as `--jvm-arg=-
 
 ### `export [--client-dir DIR] [--clean] [--mod-jar JAR] [--out WS/out/exporter] [--extra-states FILE]`
 
-1. Without `--mod-jar`, it builds the mod in `WS/BlueMap-GTNH/tools/gtnh-exporter` with
+1. Without `--mod-jar`, it builds the mod in `WS/gtnh-exporter` with
    `mise exec java@temurin-25.0.5+8.0.LTS -- ./gradlew -Porg.gradle.java.installations.paths=$(mise where java@zulu-8.98.0.107)/Contents/Home,$(mise where java@temurin-25.0.5+8.0.LTS)/Contents/Home build`.
    It takes the newest `build/libs/bluemap-gtnh-exporter-*.jar` that is not a `-dev` or `-sources` jar.
 2. Runs `prepare`, honoring `--clean`.

@@ -1,19 +1,36 @@
-# bluemap-gtnh-exporter
+# gtnh-exporter: BlueMap resource pack exporter for GT New Horizons
 
-One-shot **client** mod (Forge 1.7.10, Kotlin, GTNHGradle `modern` = Java 25 bytecode, package
+> [!WARNING]
+> Unofficial: not affiliated with BlueMap or GT New Horizons. Vibe coded (written largely by an AI coding agent), no
+> quality guarantee, use at your own risk. See the
+> [umbrella repository](https://github.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH) for details.
+
+Part of [Bluemap-GTNH-Unofficial/BlueMap-GTNH](https://github.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH). Clone the
+umbrella with `git clone --recursive`; this repository expects its sibling checkouts (`BlueMap/` and the workspace
+folders) next to it.
+
+Modded blocks in 1.7.10 are drawn by code, not by resource-pack models, so BlueMap cannot render them on its own. This
+repository holds a one-shot **client** mod that asks the running GTNH client how every modded block looks and writes
+the answer as a BlueMap resource pack, plus `launcher/`, the `gtnh-client` command that prepares a client copy and runs
+the export unattended. The exported pack contains textures of the pack's mods: use it on your own server, but do not
+redistribute it.
+
+![Part of the gtnh-zoo test scene, rendered with the exported pack](https://raw.githubusercontent.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH/main/docs/images/gtnh-zoo.jpg)
+
+The mod (`bluemap-gtnh-exporter`) is a Forge 1.7.10 client mod (Kotlin, GTNHGradle `modern` = Java 25 bytecode, package
 `de.bluecolored.bluemap.gtnh.exporter`, modid `bluemapgtnhexporter`) for GT New Horizons 2.9.0-RC-2. Once the
 client has loaded (20 client ticks after the first screen opens, i.e. the main menu), it exports the appearance of
 every registered non-`minecraft` block into a BlueMap resource pack, then quits the game (exit 0; exit 1 if the
-export threw). Vanilla blocks are rendered from the 1.13 client jar (Phase 2) and are not exported.
+export threw). Vanilla blocks are rendered from the 1.13 client jar and are not exported.
 
-The BlueMap side (renderer `gtnh:quads`, the quad-model loader and the coverage report) is the main-build module
-`gtnh-render` (`./gradlew :gtnh-render:test :gtnh-render:addonJar`).
+The BlueMap side (renderer `gtnh:quads`, the quad-model loader and the coverage report) is the `gtnh-render` module
+of the BlueMap fork (`./gradlew :gtnh-render:test :gtnh-render:addonJar` in `BlueMap/`).
 
 ## One command
 
 ```sh
-cd BlueMap-GTNH/tools/gtnh-exporter/launcher
-uv run gtnh-client export --clean --extra-states-dump ../../../../out/scenes/gtnh-zoo/dump.ndjson
+cd gtnh-exporter/launcher
+uv run gtnh-client export --clean --extra-states-dump ../../out/scenes/gtnh-zoo/dump.ndjson
 ```
 
 builds this mod with Gradle, unpacks a fresh client into `WS/clients/gtnh-2.9.0-RC-2` from the Prism zip, fetches
@@ -24,23 +41,24 @@ the Mojang/Forge/LWJGL3 libraries and assets (cache `WS/downloads/mc-cache`), st
 - `export-report.json` — per-mod counts (also inside the zip as `gtnh/export-report.json`).
 
 Build alone: `mise exec java@temurin-25.0.5+8.0.LTS -- ./gradlew -Porg.gradle.java.installations.paths=$(mise where java@zulu-8.98.0.107)/Contents/Home,$(mise where java@temurin-25.0.5+8.0.LTS)/Contents/Home build`
-(Kotlin Gradle plugin forced to 2.3.21 in `settings.gradle.kts`, D11). The C1 normalization
-`legacy/.../ResourceKeys.kt` is compiled in verbatim (`syncSharedKotlin`), so mapper and exporter cannot diverge.
+(Kotlin Gradle plugin forced to 2.3.21 in `settings.gradle.kts`). The resource-key normalization
+`legacy/.../ResourceKeys.kt` of the BlueMap fork is compiled in verbatim (`syncSharedKotlin`, read from the sibling
+checkout `WS/BlueMap`; the build fails if it is missing), so mapper and exporter cannot diverge.
 
 System properties (the launcher sets them): `bluemap.gtnh.exporter.out` (output dir), `bluemap.gtnh.exporter.extraStates`
 (file of `<modid:name> <meta>` lines, e.g. from world scans; the meta is the last token), `bluemap.gtnh.exporter.stay=true`
 (keep the client open), `bluemap.gtnh.exporter.skipBlocks=true` (GregTech dump only), `bluemap.gtnh.exporter.packSuffix=<s>`
 (output `bluemap-gtnh-resources-2.9.0-RC-2-<s>.zip`).
 
-Alternative textures (Phase 6): `export --resource-pack <zip|dir> [--extra-mod <jar>] --pack-suffix <s> --out <dir>`
+Alternative textures: `export --resource-pack <zip|dir> [--extra-mod <jar>] --pack-suffix <s> --out <dir>`
 enables the packs (first = highest priority) and mods for that run only; `mods/` and `options.txt` `resourcePacks` are
-restored afterwards. Example: `--resource-pack ../../../../downloads/modernity/Modernity-2.9.x-fa35a3d.zip --extra-mod
-../../../../downloads/modernity/MyCTMLib-1.4.3-29x.jar --pack-suffix modernity --out ../../../../out/modernity`.
+restored afterwards. Example: `--resource-pack ../../downloads/modernity/Modernity-2.9.x-fa35a3d.zip --extra-mod
+../../downloads/modernity/MyCTMLib-1.4.3-29x.jar --pack-suffix modernity --out ../../out/modernity`.
 
 Community addons (TST, GTNL, PH, 123T, NHU, Box++; jars and hashes in `WS/downloads/addons/versions.json`): a separate
 client `WS/clients/gtnh-addons` (`prepare --client-dir`), whose `config/GregTech/GregTech.cfg` has
 `crashOnNullRecipeInput=false` and whose addon configs are copied from `WS/servers/gtnh-addons/config` (GTNL
-`enableRecipeOutputChance=false`; see `testing/orchestrator/README.md`), then
+`enableRecipeOutputChance=false`; see the orchestrator README), then
 `export --client-dir WS/clients/gtnh-addons --out WS/out/exporter-addons --pack-suffix addons --extra-mod <jar>...`
 with `--extra-states-dump` of `gtnh-zoo`, `addons-zoo`, `addons-machines` and `addons-multiblocks`. The GT dump then
 holds every addon MTE and the addon casing texture pages (31, 114, 115, 116) with no exporter change.
@@ -49,7 +67,7 @@ Placeholder icons (`missingno`, Forge `MISSING_ICON_BLOCK_*`, Angelica `error_bl
 null icons) count as missing: probed metas with only placeholders are dropped, cubes need real icons, and a capture that
 contains a placeholder sprite (e.g. Chisel's CTM renderer in the empty fake world) is replaced by the block's own icons on
 its bounds (bounding-box fallback, result `bbox` with `fallbackFor: error_icon`). GregTech machines, ores 2..7 and frames
-get `"renderer": "gtnh:gt_machine" / "gtnh:gt_ore" / "gtnh:gt_frame"` on every variant (Phase 4 renderers in
+get `"renderer": "gtnh:gt_machine" / "gtnh:gt_ore" / "gtnh:gt_frame"` on every variant (GregTech renderers in
 `gtnh-render`), failed metas included with model `bluemap:block/missing`.
 
 ## What is exported
@@ -66,7 +84,7 @@ For every block × meta (metas = 0..15, `getSubBlocks` item damages / `Item.getM
 | no icon / exception | no variant; reason in the report |
 
 Identical models of one block are shared. Blockstates `assets/<N(modid)>/blockstates/<N(name)>.json` have one variant
-`meta=<n>` per exported meta (C1 normalization; meta 0 first, which BlueMap also uses for metas without a variant).
+`meta=<n>` per exported meta (resource-key normalization; meta 0 first, which BlueMap also uses for metas without a variant).
 
 **Quad model format** (parsed by `gtnh-render` `QuadModel`, also a valid vanilla model so its `textures` enter the atlas):
 `{"textures": {"t0": "<ns>:block/<path>"}, "gtnh_quads": [{"texture": "#t0", "vertices": [[x,y,z,u,v] ×4], "color": "#rrggbb", "tint": true, "cullface": "up", "light_emission": 7}]}`
@@ -283,7 +301,7 @@ Ore rendering rule (`GTBlockOre.getTextures`, the same on all six faces):
 4. `examples` holds GT's own `getTextures(meta)` result for `exampleMaterial`, normal and small, for every
    stone slot. Use it to test an implementation of the rule.
 
-### What Phase 4 still needs
+### What the GregTech renderers have to do
 
 - Read the TE NBT and pick the variant:
   - `mID`, `mFacing`, `mActive`, `mColor` (colour = `mColor - 1`),
