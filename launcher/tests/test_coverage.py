@@ -1,12 +1,14 @@
 import json
-from pathlib import Path
 
+from gtnh_client.cli import workspace
 from gtnh_client.coverage import compare, normalize_registry_name, placed_states
 
-VECTORS = Path(__file__).resolve().parents[4] / "testing" / "fixtures" / "resource-key-vectors.json"
+# golden vectors shared with the BlueMap fork's ResourceKeys (sibling checkout `BlueMap/`)
+VECTORS = workspace() / "BlueMap" / "testing" / "fixtures" / "resource-key-vectors.json"
 
 
 def test_normalization_matches_golden_vectors():
+    assert VECTORS.is_file(), f"{VECTORS} missing: clone BlueMap next to gtnh-exporter or set BMGTNH_WORKSPACE"
     vectors = json.loads(VECTORS.read_text())["vectors"]
     assert vectors
     for v in vectors:

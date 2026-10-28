@@ -7,7 +7,7 @@ plugins {
     id("org.jetbrains.kotlin.jvm")
 }
 
-// Git-based versioning is disabled (this project lives in a subdirectory of the BlueMap repo).
+// Fixed version instead of GTNHGradle's git-based versioning.
 val exporterVersion = "0.1.0"
 extra["modVersion"] = exporterVersion
 version = exporterVersion
@@ -28,12 +28,27 @@ kotlin {
     }
 }
 
-// The resource-key normalization N (contract C1) is compiled in verbatim from the legacy module, so the exporter,
-// the world reader's block-state mapper and the BlueMap-side renderers share one implementation.
+// The resource-key normalization N (contract C1) is compiled in verbatim from the BlueMap fork's legacy module, so the
+// exporter, the world reader's block-state mapper and the BlueMap-side renderers share one implementation. The fork is
+// a sibling checkout: <workspace>/BlueMap next to <workspace>/gtnh-exporter (workspace override: BMGTNH_WORKSPACE).
+val workspaceDir = providers.environmentVariable("BMGTNH_WORKSPACE").map { file(it) }.getOrElse(rootDir.parentFile)
+val sharedKotlinSource = workspaceDir.resolve("BlueMap/legacy/src/main/kotlin")
+val resourceKeysPath = "de/bluecolored/bluemap/gtnh/legacy/ResourceKeys.kt"
 val sharedKotlin = layout.buildDirectory.dir("generated/sharedKotlin")
 val syncSharedKotlin = tasks.register<Sync>("syncSharedKotlin") {
-    from("../../legacy/src/main/kotlin") {
-        include("de/bluecolored/bluemap/gtnh/legacy/ResourceKeys.kt")
+    // A provider, so the check runs only when the task is scheduled (an empty source would just skip the task).
+    from(
+        provider {
+            if (!sharedKotlinSource.resolve(resourceKeysPath).isFile) {
+                throw GradleException(
+                    "$resourceKeysPath not found under $sharedKotlinSource: clone " +
+                        "https://github.com/Bluemap-GTNH-Unofficial/BlueMap next to gtnh-exporter (or set BMGTNH_WORKSPACE)",
+                )
+            }
+            sharedKotlinSource
+        },
+    ) {
+        include(resourceKeysPath)
     }
     into(sharedKotlin)
 }

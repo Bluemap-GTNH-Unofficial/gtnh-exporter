@@ -19,7 +19,7 @@ RENDERED = ("ok",)
 STATUSES = ("ok", "fallback", "missing_model", "no_variant", "no_blockstate", "not_seen")
 
 
-# --- resource-key normalization N (contract C1; golden vectors in testing/fixtures/resource-key-vectors.json) ---
+# --- resource-key normalization N (contract C1; golden vectors in BlueMap/testing/fixtures/resource-key-vectors.json) --
 
 def normalize(segment: str) -> str:
     out = []

@@ -42,10 +42,24 @@ class CliError(Exception):
     pass
 
 
+# src/gtnh_client/cli.py -> src -> launcher -> gtnh-exporter checkout; None when installed from a wheel
+_CHECKOUT = Path(__file__).resolve().parents[3]
+EXPORTER_REPO: Path | None = _CHECKOUT if (_CHECKOUT / "launcher" / "pyproject.toml").is_file() else None
+
+
 def workspace() -> Path:
+    """The workspace holding the gtnh-exporter checkout and its siblings (`BlueMap/`, `clients/`, `downloads/`, ...):
+    BMGTNH_WORKSPACE, else the checkout's parent, else (wheel install) the current directory."""
     env = os.environ.get("BMGTNH_WORKSPACE")
-    # src/gtnh_client/cli.py -> launcher -> gtnh-exporter -> tools -> BlueMap-GTNH -> workspace
-    return Path(env) if env else Path(__file__).resolve().parents[6]
+    if env:
+        return Path(env)
+    return EXPORTER_REPO.parent if EXPORTER_REPO else Path.cwd()
+
+
+def exporter_repo() -> Path:
+    if EXPORTER_REPO is None:
+        raise CliError("not running from a gtnh-exporter checkout; pass --mod-jar or use `uv run` in gtnh-exporter/launcher")
+    return EXPORTER_REPO
 
 
 def default_zip() -> Path:
@@ -56,8 +70,12 @@ def default_client_dir() -> Path:
     return workspace() / "clients" / f"gtnh-{PACK_VERSION}"
 
 
-def exporter_project() -> Path:
-    return workspace() / "BlueMap-GTNH" / "tools" / "gtnh-exporter"
+def bluemap_repo() -> Path:
+    """The BlueMap fork checkout (sibling `BlueMap/`)."""
+    root = workspace() / "BlueMap"
+    if not (root / "settings.gradle.kts").is_file():
+        raise CliError(f"BlueMap checkout not found at {root}; clone it next to gtnh-exporter or set BMGTNH_WORKSPACE")
+    return root
 
 
 def make_layout(client_dir: Path | None) -> Layout:
@@ -158,7 +176,7 @@ def mise_where(tool: str) -> str:
 
 
 def build_exporter_mod() -> Path:
-    project = exporter_project()
+    project = exporter_repo()
     homes = ",".join(f"{mise_where(t)}/Contents/Home" for t in (ZULU8_TOOL, JAVA_TOOL))
     cmd = ["mise", "exec", JAVA_TOOL, "--", "./gradlew", f"-Porg.gradle.java.installations.paths={homes}", "build"]
     print(f"[export] building exporter mod: {subprocess.list2cmdline(cmd)} (cwd {project})", flush=True)
@@ -359,7 +377,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def bluemap_jars(no_build: bool) -> tuple[Path, list[Path]]:
     """(CLI shadow jar, [legacy addon, gtnh-render addon]) from the BlueMap build, built from the current tree."""
-    root = exporter_project().parent.parent
+    root = bluemap_repo()
     if not no_build:
         cmd = ["mise", "exec", "--", "./gradlew", ":cli:shadowJar", ":legacy:addonJar", ":gtnh-render:addonJar"]
         print(f"[coverage] building: {subprocess.list2cmdline(cmd)} (cwd {root})", flush=True)
@@ -450,7 +468,7 @@ def cmd_screens(args: argparse.Namespace) -> int:
             "--views", json.dumps([{"name": k, "hash": v} for k, v in views.items()]),
         ]
         install = ["uv", "run", "--with", "playwright", "playwright", "install", "chromium"]
-        project = Path(__file__).resolve().parents[2]
+        project = exporter_repo() / "launcher"
         if subprocess.run(install, cwd=project).returncode != 0:
             raise CliError("playwright install chromium failed")
         return subprocess.run(shots, cwd=project).returncode
