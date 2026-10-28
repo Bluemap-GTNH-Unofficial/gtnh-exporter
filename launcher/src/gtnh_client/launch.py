@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -238,3 +239,31 @@ def _console_write(line: bytes, state: dict) -> None:
         sys.stdout.buffer.flush()
     except (BrokenPipeError, OSError, ValueError):
         state["closed"] = True
+
+
+CAFFEINATE_FLAGS = ["-d", "-i", "-m", "-s", "-u"]
+
+
+@contextlib.contextmanager
+def keep_awake(seconds: float):
+    """On macOS, holds `caffeinate -dimsu` while the client runs: with the display asleep the client's GL loop is
+    throttled (SDL_GL_SwapWindow/frame pacing) so much that Forge's login handshake times out. `-u` also wakes the
+    display (it needs `-t`, so the assertion is bounded by the client timeout plus a minute). No-op elsewhere."""
+    exe = shutil.which("caffeinate") if sys.platform == "darwin" else None
+    if exe is None:
+        yield None
+        return
+    proc = subprocess.Popen(
+        [exe, *CAFFEINATE_FLAGS, "-t", str(int(seconds) + 60)],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    print(f"[run] caffeinate {' '.join(CAFFEINATE_FLAGS)} (pid {proc.pid}) keeps the display awake", flush=True)
+    try:
+        yield proc
+    finally:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()

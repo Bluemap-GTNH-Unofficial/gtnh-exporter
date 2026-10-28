@@ -24,6 +24,7 @@ from gtnh_client.launch import (
     configure_lwjgl3ify,
     install_mods,
     install_resource_packs,
+    keep_awake,
     mute_sound,
     restore_resource_packs,
     run_process,
@@ -109,7 +110,8 @@ def run_client(
         cmd = build_command(layout, profile, xmx=xmx, jvm_args=jvm_args, username=username, game_args=list(game_args))
         log = log or layout.client_dir / "logs-launcher" / f"client-{datetime.now():%Y%m%d-%H%M%S}.log"
         print(f"[run] log: {log}", flush=True)
-        return run_process(cmd, cwd=layout.minecraft_dir, log_file=log, timeout=timeout)
+        with keep_awake(timeout):
+            return run_process(cmd, cwd=layout.minecraft_dir, log_file=log, timeout=timeout)
     finally:
         restore_resource_packs(layout.minecraft_dir, installed_packs, previous_packs)
         for jar in temporary_mods:

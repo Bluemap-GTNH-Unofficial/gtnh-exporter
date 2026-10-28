@@ -75,3 +75,66 @@ def test_sigterm_kills_client_tree_and_returns(tmp_path: Path):
         except ProcessLookupError:
             alive = False
         assert not alive
+
+
+def _fake_caffeinate(tmp_path: Path, monkeypatch) -> Path:
+    """A `caffeinate` on PATH that records its pid and arguments, then sleeps until killed."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    record = tmp_path / "caffeinate.txt"
+    script = bin_dir / "caffeinate"
+    script.write_text(f'#!/bin/sh\necho "$$ $*" > {record}\nexec sleep 600\n')
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setattr(sys, "platform", "darwin")
+    return record
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    # a reaped-later zombie still answers kill(0); check its state
+    state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+    return bool(state) and not state.startswith("Z")
+
+
+def _wait_for(path: Path) -> str:
+    for _ in range(50):
+        if path.exists() and path.read_text().strip():
+            return path.read_text().strip()
+        time.sleep(0.1)
+    raise AssertionError(f"{path} not written")
+
+
+def test_keep_awake_holds_caffeinate_for_the_block(tmp_path: Path, monkeypatch):
+    from gtnh_client.launch import keep_awake
+
+    record = _fake_caffeinate(tmp_path, monkeypatch)
+    with keep_awake(100) as proc:
+        pid, *args = _wait_for(record).split()
+        assert int(pid) == proc.pid and _alive(proc.pid)
+        assert args == ["-d", "-i", "-m", "-s", "-u", "-t", "160"]
+    assert not _alive(int(pid))
+
+
+def test_keep_awake_stops_caffeinate_on_interrupt(tmp_path: Path, monkeypatch):
+    from gtnh_client.launch import keep_awake
+
+    record = _fake_caffeinate(tmp_path, monkeypatch)
+    try:
+        with keep_awake(10):
+            pid = int(_wait_for(record).split()[0])
+            raise KeyboardInterrupt
+    except KeyboardInterrupt:
+        pass
+    assert not _alive(pid)
+
+
+def test_keep_awake_is_a_no_op_off_macos(monkeypatch):
+    from gtnh_client.launch import keep_awake
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    with keep_awake(10) as proc:
+        assert proc is None

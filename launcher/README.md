@@ -58,6 +58,10 @@ Cleanup (all launching commands): SIGTERM/SIGHUP/Ctrl-C kill the whole Java proc
 `mods/`, temporary mods and resource packs; an exporter jar left in `mods-disabled/` by a hard-killed launcher is moved
 back on the next run.
 
+Display sleep (all launching commands, macOS only): while the client runs the launcher holds `caffeinate -dimsu -t
+<timeout + 60 s>` and stops it when the client exits or the launcher is interrupted. With the display asleep the
+client's GL loop is throttled so hard that Forge's login handshake times out even with `--connect-delay`.
+
 ### `run [--client-dir DIR] [--mod JAR ...] [--jvm-arg ARG ...] [--xmx 10G] [--timeout 1800] [--username BlueMapExporter] [--log FILE]`
 
 1. Runs `prepare` with the default zip if `DIR` does not exist. Otherwise it only fetches cache files
