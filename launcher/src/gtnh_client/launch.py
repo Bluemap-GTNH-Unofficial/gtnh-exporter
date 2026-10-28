@@ -126,7 +126,7 @@ def restore_resource_packs(minecraft_dir: Path, installed: list[Path], previous:
 
 
 def build_command(
-    layout: Layout, profile: Profile, *, xmx: str, jvm_args: list[str], username: str
+    layout: Layout, profile: Profile, *, xmx: str, jvm_args: list[str], username: str, game_args: list[str] = ()
 ) -> list[str]:
     assert profile.minecraft_arguments is not None and profile.main_class is not None
     cmd = list(JAVA_CMD)
@@ -158,6 +158,7 @@ def build_command(
         cmd.append(re.sub(r"\$\{(\w+)\}", substitute, token))
     for tweaker in profile.tweakers:
         cmd += ["--tweakClass", tweaker]
+    cmd += game_args
     return cmd
 
 
@@ -217,10 +218,11 @@ def run_process(cmd: list[str], *, cwd: Path, log_file: Path, timeout: float) ->
             print(f"[run] timeout after {timeout:.0f}s; killing process tree", flush=True)
             _kill_tree(proc)
             code = TIMEOUT_EXIT
-        except KeyboardInterrupt:
+        except KeyboardInterrupt as interrupt:
             print("[run] interrupted; killing process tree", flush=True)
             _kill_tree(proc)
-            code = 130
+            # 128 + signal number: 130 for Ctrl-C (SIGINT), 143 for SIGTERM, 129 for SIGHUP
+            code = 128 + getattr(interrupt, "signum", signal.SIGINT)
         reader.join(timeout=10)
         log.write(f"# exit {code} after {time.monotonic() - start:.1f}s\n".encode())
     return code

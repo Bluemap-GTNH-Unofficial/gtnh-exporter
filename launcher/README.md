@@ -42,6 +42,22 @@ classifier. A bare `osx` matches only on x86 hosts. So `*-natives-macos` (x86_64
 higher version replaces the earlier one in place: forge's guava 17.0 takes the slot of Minecraft's
 guava 15.0.
 
+### `play [--client-dir DIR] [--server HOST[:PORT]] [--connect-delay 2] [--username BlueMapPlayer] [--jvm-arg ARG ...] [--xmx 10G] [--timeout 1800] [--log FILE]`
+
+Launches the client like `run` (minimized, muted) but without the exporter mod: `bluemap-gtnh-exporter*.jar` is moved
+to `.minecraft/mods-disabled/` for the session and moved back afterwards. `--server` appends
+`--server <host> --port <port>` (default port 25565) to the game arguments, so 1.7.10 connects on start, e.g.
+`uv run gtnh-client play --server 127.0.0.1:25567 --username Tester` against an `online-mode=false` server.
+
+`--connect-delay` (default 2 s, 0 = connect directly) routes the connection through a local proxy
+(`gtnh_client.proxy`) that holds the server's first reply: Forge 1.7.10 opens `GuiConnecting` before it creates the
+client latch, so a fast local server's LoginSuccess is lost and the FML handshake times out ("Timeout waiting for
+client thread to catch up!").
+
+Cleanup (all launching commands): SIGTERM/SIGHUP/Ctrl-C kill the whole Java process tree and still restore
+`mods/`, temporary mods and resource packs; an exporter jar left in `mods-disabled/` by a hard-killed launcher is moved
+back on the next run.
+
 ### `run [--client-dir DIR] [--mod JAR ...] [--jvm-arg ARG ...] [--xmx 10G] [--timeout 1800] [--username BlueMapExporter] [--log FILE]`
 
 1. Runs `prepare` with the default zip if `DIR` does not exist. Otherwise it only fetches cache files
@@ -72,7 +88,7 @@ stdout and stderr are merged and streamed to the console and to `--log`. The def
 `DIR/logs-launcher/client-<YYYYmmdd-HHMMSS>.log`, starting with the cwd and the full command line.
 The command exits with the java exit code. When `--timeout` expires, the whole process group
 (the mise wrapper and java) gets SIGTERM, then SIGKILL after 15 s, and the exit code is 124.
-Ctrl-C kills the group the same way and exits with 130.
+Ctrl-C kills the group the same way and exits with 130; SIGTERM / SIGHUP to the launcher exit with 143 / 129.
 
 Values that start with `-` work as `--jvm-arg -Dfoo=bar` as well as `--jvm-arg=-Dfoo=bar`.
 

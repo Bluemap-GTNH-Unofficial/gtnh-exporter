@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -12,6 +13,7 @@ from datetime import datetime
 from pathlib import Path
 
 from gtnh_client import coverage
+from gtnh_client.proxy import DelayProxy
 from gtnh_client.download import DownloadError
 from gtnh_client.instance import Layout, PrepareError, ensure_downloads, prepare
 from gtnh_client.launch import (
@@ -72,23 +74,39 @@ def run_client(
     log: Path | None,
     extra_mods: list[Path] = (),
     resource_packs: list[Path] = (),
+    game_args: list[str] = (),
+    disable_exporter: bool = False,
 ) -> int:
     """`extra_mods` and `resource_packs` are installed for this run only and removed afterwards (options.txt
-    `resourcePacks` restored), so later default runs are unaffected."""
+    `resourcePacks` restored), so later default runs are unaffected. `disable_exporter` parks the exporter mod in
+    `.minecraft/mods-disabled/` for the session (it would export and quit) and puts it back afterwards."""
     if not layout.client_dir.exists():
         prepare(layout, default_zip())
     profile = layout.load_profile()
     ensure_downloads(layout, profile)
+    recover_parked_mods(layout.minecraft_dir)
     install_mods(layout.minecraft_dir, mods)
     mods_dir = layout.minecraft_dir / "mods"
     temporary_mods = [mods_dir / jar.name for jar in extra_mods if not (mods_dir / jar.name).exists()]
     install_mods(layout.minecraft_dir, list(extra_mods))
+    parked: list[tuple[Path, Path]] = []
+    if disable_exporter:
+        disabled = layout.minecraft_dir / "mods-disabled"
+        for jar in mods_dir.glob(EXPORTER_MOD_GLOB):
+            disabled.mkdir(exist_ok=True)
+            target = disabled / jar.name
+            jar.replace(target)
+            parked.append((target, jar))
+            print(f"[run] parked {jar.name} in {disabled} for this session")
     installed_packs, previous_packs = install_resource_packs(layout.minecraft_dir, list(resource_packs))
+    # SIGTERM/SIGHUP (e.g. the caller's process group is terminated) must also kill the client and run the cleanup
+    # below; run_process kills the Java process tree on KeyboardInterrupt
+    previous_handlers = {sig: signal.signal(sig, _interrupt) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         cfg = configure_lwjgl3ify(layout.minecraft_dir)
         print(f"[run] {cfg}: window " + ", ".join(f"{k}={str(v).lower()}" for k, v in LWJGL3IFY_WINDOW.items()))
         print(f"[run] {mute_sound(layout.minecraft_dir)}: {MUTE_OPTION[0]}:{MUTE_OPTION[1]} (muted)")
-        cmd = build_command(layout, profile, xmx=xmx, jvm_args=jvm_args, username=username)
+        cmd = build_command(layout, profile, xmx=xmx, jvm_args=jvm_args, username=username, game_args=list(game_args))
         log = log or layout.client_dir / "logs-launcher" / f"client-{datetime.now():%Y%m%d-%H%M%S}.log"
         print(f"[run] log: {log}", flush=True)
         return run_process(cmd, cwd=layout.minecraft_dir, log_file=log, timeout=timeout)
@@ -97,6 +115,40 @@ def run_client(
         for jar in temporary_mods:
             jar.unlink(missing_ok=True)
             print(f"[run] removed extra mod {jar}")
+        for parked_jar, original in parked:
+            parked_jar.replace(original)
+            print(f"[run] restored {original}")
+        recover_parked_mods(layout.minecraft_dir)  # removes the then empty mods-disabled/
+        for sig, handler in previous_handlers.items():
+            signal.signal(sig, handler)
+
+
+class Terminated(KeyboardInterrupt):
+    """SIGTERM/SIGHUP delivered as an interrupt, so cleanup runs; `signum` sets the exit code (128 + signum)."""
+
+    def __init__(self, signum: int):
+        super().__init__(f"signal {signum}")
+        self.signum = signum
+
+
+def _interrupt(signum: int, frame) -> None:
+    raise Terminated(signum)
+
+
+def recover_parked_mods(minecraft_dir: Path) -> None:
+    """Moves exporter jars left in `mods-disabled/` by a launcher that was killed hard (SIGKILL) back to `mods/`."""
+    disabled = minecraft_dir / "mods-disabled"
+    if not disabled.is_dir():
+        return
+    for jar in disabled.glob(EXPORTER_MOD_GLOB):
+        target = minecraft_dir / "mods" / jar.name
+        if target.exists():
+            jar.unlink()
+        else:
+            jar.replace(target)
+            print(f"[run] recovered {target} from an earlier interrupted session")
+    if not any(disabled.iterdir()):
+        disabled.rmdir()
 
 
 def mise_where(tool: str) -> str:
@@ -123,6 +175,35 @@ def build_exporter_mod() -> Path:
 def cmd_prepare(args: argparse.Namespace) -> int:
     prepare(make_layout(args.client_dir), args.zip, clean=args.clean)
     return 0
+
+
+def cmd_play(args: argparse.Namespace) -> int:
+    """Plays (without the exporter mod) and optionally auto-connects to a server via 1.7.10's `--server`/`--port`."""
+    game_args: list[str] = []
+    proxy = None
+    if args.server:
+        host, _, port = args.server.rpartition(":") if ":" in args.server else (args.server, "", "25565")
+        if args.connect_delay > 0:
+            # Forge 1.7.10 login race against fast servers, see gtnh_client.proxy
+            proxy = DelayProxy(host, int(port), args.connect_delay).start()
+            print(f"[play] connecting through 127.0.0.1:{proxy.port} (server replies held {args.connect_delay:g}s)")
+            host, port = "127.0.0.1", str(proxy.port)
+        game_args = ["--server", host, "--port", port]
+    try:
+        return run_client(
+            make_layout(args.client_dir),
+            mods=[],
+            jvm_args=args.jvm_arg,
+            xmx=args.xmx,
+            timeout=args.timeout,
+            username=args.username,
+            log=args.log,
+            game_args=game_args,
+            disable_exporter=True,
+        )
+    finally:
+        if proxy:
+            proxy.close()
 
 
 def cmd_run(args: argparse.Namespace) -> int:
@@ -230,6 +311,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--username", default="BlueMapExporter", help="offline username (default %(default)s)")
     p.add_argument("--log", type=Path, help="log file (default <client-dir>/logs-launcher/client-<timestamp>.log)")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("play", help="launch the client without the exporter mod, optionally auto-connecting to a server")
+    client_dir_arg(p)
+    p.add_argument("--server", help="host[:port] to connect to on start (1.7.10 --server/--port), e.g. 127.0.0.1:25567")
+    p.add_argument("--connect-delay", type=float, default=2.0, help="connect through a local proxy that holds the server's first reply this many seconds, working around Forge's login race with fast local servers; 0 = direct (default %(default)s)")
+    p.add_argument("--username", default="BlueMapPlayer", help="offline username (default %(default)s)")
+    p.add_argument("--jvm-arg", action="append", default=[], help="extra JVM argument (repeatable)")
+    p.add_argument("--xmx", default="10G", help="heap size for -Xms/-Xmx (default %(default)s)")
+    p.add_argument("--timeout", type=float, default=1800, help="kill the client after this many seconds, exit 124")
+    p.add_argument("--log", type=Path, help="log file (default <client-dir>/logs-launcher/client-<timestamp>.log)")
+    p.set_defaults(func=cmd_play)
 
     p = sub.add_parser("export", help="build the exporter mod, prepare, run it and verify the export outputs")
     client_dir_arg(p)
