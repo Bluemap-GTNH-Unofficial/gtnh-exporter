@@ -54,12 +54,19 @@ class Exporter(private val mc: Minecraft, private val outDir: File, private val 
                 ExporterMod.log.error("Copying mod assets failed", t)
                 -1
             }
+            val aspects = try {
+                modData.writeAspects()
+            } catch (t: Throwable) {
+                ExporterMod.log.error("Writing Thaumcraft aspects failed", t)
+                -1
+            }
             report.add(
                 "modData",
                 JsonObject().apply {
                     addProperty("chiselStates", modData.chiselStates)
                     addProperty("myctmlibTextures", textures.myCtm.size)
                     addProperty("assets", modAssets)
+                    addProperty("aspects", aspects)
                 },
             )
             val blocksDone = System.nanoTime()

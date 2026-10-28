@@ -37,6 +37,14 @@ enables the packs (first = highest priority) and mods for that run only; `mods/`
 restored afterwards. Example: `--resource-pack ../../../../downloads/modernity/Modernity-2.9.x-fa35a3d.zip --extra-mod
 ../../../../downloads/modernity/MyCTMLib-1.4.3-29x.jar --pack-suffix modernity --out ../../../../out/modernity`.
 
+Community addons (TST, GTNL, PH, 123T, NHU, Box++; jars and hashes in `WS/downloads/addons/versions.json`): a separate
+client `WS/clients/gtnh-addons` (`prepare --client-dir`), whose `config/GregTech/GregTech.cfg` has
+`crashOnNullRecipeInput=false` and whose addon configs are copied from `WS/servers/gtnh-addons/config` (GTNL
+`enableRecipeOutputChance=false`; see `testing/orchestrator/README.md`), then
+`export --client-dir WS/clients/gtnh-addons --out WS/out/exporter-addons --pack-suffix addons --extra-mod <jar>...`
+with `--extra-states-dump` of `gtnh-zoo`, `addons-zoo`, `addons-machines` and `addons-multiblocks`. The GT dump then
+holds every addon MTE and the addon casing texture pages (31, 114, 115, 116) with no exporter change.
+
 Placeholder icons (`missingno`, Forge `MISSING_ICON_BLOCK_*`, Angelica `error_block_*`, which Angelica returns instead of
 null icons) count as missing: probed metas with only placeholders are dropped, cubes need real icons, and a capture that
 contains a placeholder sprite (e.g. Chisel's CTM renderer in the empty fake world) is replaced by the block's own icons on

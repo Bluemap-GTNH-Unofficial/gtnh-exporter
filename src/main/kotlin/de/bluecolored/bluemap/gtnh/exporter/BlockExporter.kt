@@ -207,6 +207,8 @@ class BlockExporter(
         val explicitMetas = HashSet<Int>().also { set -> extraStates[name]?.let(set::addAll) }
         // failed metas that exist in worlds (0..15 or listed as extra states), for RENDERER_OVERRIDES blocks
         val failedInWorld = java.util.TreeSet<Int>()
+        // metas whose tile entity has a dedicated TESR port (`ModData.rendererForTileEntity`)
+        val tileEntityRenderers = HashMap<Int, String>()
 
         for (meta in metas) {
             val metaInfo = JsonObject().apply { addProperty("meta", meta) }
@@ -242,6 +244,7 @@ class BlockExporter(
                     if (meta <= 15 || meta in explicitMetas) failedInWorld.add(meta)
                 }
             }
+            metaInfo.get("tileEntity")?.asString?.let(ModData::rendererForTileEntity)?.let { tileEntityRenderers[meta] = it }
             stats.states++
             metaInfos.add(metaInfo)
         }
@@ -262,6 +265,7 @@ class BlockExporter(
         val blockRenderer = RENDERER_OVERRIDES[name] ?: ModData.rendererFor(name)
         for (meta in (variants.keys + failedInWorld).toSortedSet()) {
             val renderer = blockRenderer
+                ?: tileEntityRenderers[meta]
                 ?: (if (chisel[meta]?.get("fullCube")?.asBoolean == true) "gtnh:chisel_ctm" else null)
                 ?: continue
             val variant = variants.getOrPut(meta) { JsonObject().apply { addProperty("model", "bluemap:block/missing") } }
