@@ -15,12 +15,14 @@ import net.minecraft.world.biome.BiomeGenBase
 import net.minecraft.world.chunk.IChunkProvider
 import net.minecraft.world.storage.SaveHandlerMP
 import net.minecraftforge.common.util.ForgeDirection
+import kotlin.math.abs
 
 /**
- * A client-side world containing a single block (with its tile entity, if any) at [X], [Y], [Z], surrounded by air,
- * full sky light and one biome everywhere. It is a real [World] (not just an IBlockAccess) because many renderers
- * and tile entities cast to or call into `World`. Neighbour-dependent renderers (connected textures, fences, pipes)
- * therefore see their unconnected base state. Nothing is ticked, saved or networked.
+ * A client-side world containing a single block (with its tile entity, if any) at [X], [Y], [Z], surrounded by air
+ * (or, with [copiesAround], by copies of itself), full sky light and one biome everywhere. It is a real [World] (not
+ * just an IBlockAccess) because many renderers and tile entities cast to or call into `World`. Neighbour-dependent
+ * renderers (connected textures, fences, pipes) therefore see their unconnected base state. Nothing is ticked, saved
+ * or networked.
  */
 class FakeWorld private constructor(provider: WorldProvider) :
     World(SaveHandlerMP(), "bluemap-gtnh-export", provider, SETTINGS, Profiler()) {
@@ -42,7 +44,13 @@ class FakeWorld private constructor(provider: WorldProvider) :
         this.tileEntity = tileEntity
     }
 
+    /** Whether the six blocks next to the centre are copies of it (without tile entity), to probe face culling. */
+    var copiesAround = false
+
     private fun isCenter(x: Int, y: Int, z: Int) = x == X && y == Y && z == Z
+
+    private fun isBlock(x: Int, y: Int, z: Int) =
+        isCenter(x, y, z) || (copiesAround && abs(x - X) + abs(y - Y) + abs(z - Z) == 1)
 
     override fun createChunkProvider(): IChunkProvider = ChunkProviderClient(this)
 
@@ -50,13 +58,13 @@ class FakeWorld private constructor(provider: WorldProvider) :
 
     override fun getEntityByID(id: Int): Entity? = null
 
-    override fun getBlock(x: Int, y: Int, z: Int): Block = if (isCenter(x, y, z)) block else Blocks.air
+    override fun getBlock(x: Int, y: Int, z: Int): Block = if (isBlock(x, y, z)) block else Blocks.air
 
     override fun getTileEntity(x: Int, y: Int, z: Int): TileEntity? = if (isCenter(x, y, z)) tileEntity else null
 
-    override fun getBlockMetadata(x: Int, y: Int, z: Int): Int = if (isCenter(x, y, z)) meta else 0
+    override fun getBlockMetadata(x: Int, y: Int, z: Int): Int = if (isBlock(x, y, z)) meta else 0
 
-    override fun isAirBlock(x: Int, y: Int, z: Int): Boolean = !isCenter(x, y, z) || block.isAir(this, x, y, z)
+    override fun isAirBlock(x: Int, y: Int, z: Int): Boolean = !isBlock(x, y, z) || block.isAir(this, x, y, z)
 
     override fun blockExists(x: Int, y: Int, z: Int): Boolean = y in 0..255
 
@@ -88,7 +96,7 @@ class FakeWorld private constructor(provider: WorldProvider) :
     override fun getIndirectPowerLevelTo(x: Int, y: Int, z: Int, direction: Int): Int = 0
 
     override fun isSideSolid(x: Int, y: Int, z: Int, side: ForgeDirection, default: Boolean): Boolean =
-        if (isCenter(x, y, z)) block.isSideSolid(this, x, y, z, side) else false
+        if (isBlock(x, y, z)) block.isSideSolid(this, x, y, z, side) else false
 
     override fun getHeight(): Int = 256
 

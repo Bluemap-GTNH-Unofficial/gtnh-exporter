@@ -20,6 +20,8 @@ import javax.imageio.ImageIO
  * Pixel sources, in order: the sprite's PNG through the resource manager (honours resource packs; `.mcmeta`
  * animations are copied, animation strips without one are cut to their first frame), the sprite's retained frame
  * data, and finally a crop of the GL atlas read back once (sprites with custom loaders or generated pixels).
+ * MyCTMLib connection sheets always come from their PNG: MyCTMLib's atlas sprite (`CtmSheetSprite`) holds them
+ * re-laid out, every variant surrounded by 8 pixels of copied edge texels.
  */
 class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
     enum class Source { RESOURCE, FRAME_DATA, ATLAS, FAILED }
@@ -32,7 +34,7 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
     /** MyCTMLib connected textures (`myctmlib` section of a texture's `.mcmeta`, e.g. from Modernity-GTNH), by texture key. */
     val myCtm = java.util.TreeMap<String, com.google.gson.JsonObject>()
 
-    /** Connected-texture sheets: tall or wide images that are not animation strips. */
+    /** MyCTMLib connection and alt sheets (`connection` / `alt` of a `myctmlib` section), exported as the pack ships them. */
     private val ctmSheets = HashSet<String>()
 
     /** All uploaded block sprites by icon name. */
@@ -88,7 +90,7 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
         val iconPath = if (colon < 0) name else name.substring(colon + 1)
         val location = ResourceLocation(domain, "textures/blocks/$iconPath.png")
 
-        if (sprite == null || !sprite.hasCustomLoader(mc.resourceManager, location)) {
+        if (sprite == null || name in ctmSheets || !sprite.hasCustomLoader(mc.resourceManager, location)) {
             val image = try {
                 mc.resourceManager.getResource(location).inputStream.use { ImageIO.read(it) }
             } catch (_: IOException) {
@@ -120,6 +122,16 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
             return Source.FAILED
         }
 
+        val (image, source) = spriteImage(sprite) ?: run {
+            failures.add("$name: empty atlas region")
+            return Source.FAILED
+        }
+        pack.png(path, image)
+        return source
+    }
+
+    /** The sprite's first frame: its retained frame data, else a crop of the GL atlas. */
+    private fun spriteImage(sprite: TextureAtlasSprite): Pair<BufferedImage, Source>? {
         if (sprite.frameCount > 0) {
             val frame = sprite.getFrameTextureData(0)
             if (frame != null && frame.isNotEmpty() && frame[0] != null) {
@@ -129,18 +141,43 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
                 if (w > 0 && h > 0 && pixels.size >= w * h) {
                     val image = BufferedImage(w, h, BufferedImage.TYPE_INT_ARGB)
                     image.setRGB(0, 0, w, h, pixels, 0, w)
-                    pack.png(path, image)
-                    return Source.FRAME_DATA
+                    return image to Source.FRAME_DATA
                 }
             }
         }
+        return cropAtlas(sprite)?.let { it to Source.ATLAS }
+    }
 
-        val image = cropAtlas(sprite) ?: run {
-            failures.add("$name: empty atlas region")
-            return Source.FAILED
+    /**
+     * Records an Angelica/MCPatcher `method=compact` connected texture ([tiles] 0..4, see [McPatcherCtm]) as a MyCTMLib
+     * `compact` entry of tile 0, which is what a face shows without matching neighbours. Its connection sheet holds
+     * tiles 1, 2, 3, 4 as the top-left, top-right, bottom-left and bottom-right variants, i.e. MyCTMLib's all,
+     * up/down, left/right and inner-corner variants, so `gtnh:ctm` picks the quarters Angelica draws. Returns tile 0's
+     * texture key, or null when a tile has no pixels.
+     */
+    fun recordMcPatcherCompact(tiles: List<TextureAtlasSprite>): String? {
+        val base = export(tiles[0].iconName, tiles[0]) ?: return null
+        if (base in myCtm) return base
+        val images = tiles.subList(1, 5).map { tile -> spriteImage(tile)?.first ?: return null }
+        val size = images[0].width
+        if (images.any { it.width != size || it.height != size }) {
+            failures.add("${tiles[0].iconName}: MCPatcher compact tiles differ in size")
+            return null
         }
-        pack.png(path, image)
-        return Source.ATLAS
+        val sheet = BufferedImage(size * 2, size * 2, BufferedImage.TYPE_INT_ARGB)
+        val pixels = IntArray(size * size)
+        for ((i, image) in images.withIndex()) {
+            image.getRGB(0, 0, size, size, pixels, 0, size)
+            sheet.setRGB(i % 2 * size, i / 2 * size, size, size, pixels, 0, size)
+        }
+        val namespace = base.substringBefore(':')
+        val value = base.substringAfter(':')
+        pack.png("assets/$namespace/textures/${value}_ctm.png", sheet)
+        myCtm[base] = com.google.gson.JsonObject().apply {
+            addProperty("method", "compact")
+            addProperty("connection", "${base}_ctm")
+        }
+        return base
     }
 
     private fun cropAtlas(sprite: TextureAtlasSprite): BufferedImage? {

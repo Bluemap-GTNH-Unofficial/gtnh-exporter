@@ -39,6 +39,7 @@ class BlockExporter(
 ) {
     private val world = FakeWorld.create()
     private val renderBlocks = RenderBlocks(world)
+    private val mcPatcher = McPatcherCtm.load()
 
     /** modid -> statistics. */
     val mods = TreeMap<String, ModStats>()
@@ -289,14 +290,43 @@ class BlockExporter(
             pack.json("assets/$namespace/blockstates/$value.json", JsonObject().apply { add("variants", variantsJson) })
         }
 
+        val cullingIdentical = block is BlockBreakable || (!opaque && hidesFacesAgainstItself(block, variants.keys.firstOrNull() ?: 0))
         blockProperties.getOrPut(namespace) { JsonObject() }.add(
             "$namespace:$value",
             JsonObject().apply {
                 addProperty("culling", opaque)
                 addProperty("occluding", opaque)
-                if (block is BlockBreakable) addProperty("cullingIdentical", true)
+                if (cullingIdentical) addProperty("cullingIdentical", true)
             },
         )
+    }
+
+    /**
+     * Whether the block shows its faces next to air but hides them next to a copy of itself, like vanilla glass
+     * ([BlockBreakable]) or BartWorks' glass (`BWBlocksGlass.shouldSideBeRendered`): BlueMap's `cullingIdentical`.
+     */
+    private fun hidesFacesAgainstItself(block: Block, meta: Int): Boolean {
+        world.set(block, meta, null)
+        safe { block.setBlockBoundsBasedOnState(world, FakeWorld.X, FakeWorld.Y, FakeWorld.Z) }
+        fun rendered(side: Int): Boolean? {
+            val d = ForgeDirection.getOrientation(side)
+            return safe {
+                block.shouldSideBeRendered(world, FakeWorld.X + d.offsetX, FakeWorld.Y + d.offsetY, FakeWorld.Z + d.offsetZ, side)
+            }
+        }
+        if ((0 until 6).any { rendered(it) != true }) return false
+        world.copiesAround = true
+        try {
+            return (0 until 6).all { rendered(it) == false }
+        } finally {
+            world.copiesAround = false
+        }
+    }
+
+    /** Tile 0 of the Angelica/MCPatcher `method=compact` override that draws [icon] on [side] of [block]:[meta], recorded for `gtnh:ctm`. */
+    private fun compactTile0(icon: IIcon, block: Block, side: Int, meta: Int): IIcon? {
+        val tiles = mcPatcher?.tiles(icon, block, side, meta) ?: return null
+        return if (textures.recordMcPatcherCompact(tiles) != null) tiles[0] else null
     }
 
     private sealed class StateResult {
@@ -352,11 +382,13 @@ class BlockExporter(
         blockShapes[meta] = shapeOf(block)
         blockBounds[meta] = bounds
 
-        // connected-texture tiles (Angelica/MCPatcher `mcpatcher/ctm/...`) depend on neighbours: use the base icon
+        // connected-texture tiles (Angelica/MCPatcher `mcpatcher/ctm/...`) depend on neighbours: use the base icon; a
+        // `method=compact` override is drawn from its tile 0 and connected by `gtnh:ctm` (see [McPatcherCtm])
         val worldIcons = (0 until 6).map { side ->
             val icon = safe { block.getIcon(world, FakeWorld.X, FakeWorld.Y, FakeWorld.Z, side) }
                 ?.takeUnless { TextureExporter.isErrorIcon(it.iconName) }
-            if (icon == null || (TextureExporter.isCtmTile(icon.iconName) && itemIcons[side] != null)) itemIcons[side] else icon
+            val base = if (icon == null || (TextureExporter.isCtmTile(icon.iconName) && itemIcons[side] != null)) itemIcons[side] else icon
+            base?.let { compactTile0(it, block, side, meta) } ?: base
         }
         info.add("icons", JsonArray().also { a -> worldIcons.forEach { a.addString(it?.iconName) } })
         safe { block.getRenderColor(meta) }?.let { info.addProperty("renderColor", String.format("#%06x", it and 0xFFFFFF)) }
@@ -490,7 +522,12 @@ class BlockExporter(
                 unmappedQuads++
                 continue
             }
-            val texture = if (TextureExporter.isCtmTile(sprite.iconName)) null else textures.export(sprite)
+            val texture = if (TextureExporter.isCtmTile(sprite.iconName)) {
+                // Angelica drew the face alone: a `method=compact` override's tile 0 stays, connected by `gtnh:ctm`
+                mcPatcher?.tilesOf(sprite)?.let(textures::recordMcPatcherCompact)
+            } else {
+                textures.export(sprite)
+            }
             if (texture == null) {
                 errorQuads++
                 continue

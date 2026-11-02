@@ -113,7 +113,14 @@ foliage / water color everywhere → `@grass` / `@foliage` / `@water`; constant 
 but unmatched → the plains value (reported as `biome-unmatched`).
 
 **Properties** `assets/<ns>/blockProperties.json`: `culling` = `occluding` = `isOpaqueCube`; `cullingIdentical` for
-`BlockBreakable` (glass-like).
+`BlockBreakable` (glass-like) and for any other non-opaque block that shows all six faces next to air and hides them
+next to copies of itself (`shouldSideBeRendered` with `FakeWorld.copiesAround`, e.g. BartWorks glass, panes, bars).
+
+**Connected textures** `gtnh/mods/myctmlib.json`: MyCTMLib `compact` sections (with Modernity-GTNH), their
+connection and alt sheets exported from the PNG the pack ships (not MyCTMLib's padded atlas copy), plus every
+Angelica/MCPatcher `method=compact` override Angelica loaded (`McPatcherCtm.kt`, e.g. GT's
+`bartworks/mcpatcher/ctm/bwtieredglass/*`), recorded as an entry of its tile 0 with a 2×2 sheet of tiles 1–4. Variants
+drawing such a texture get `"renderer": "gtnh:ctm"`.
 
 **Shapes** `data/gtnh/block_shapes.json` (for the legacy reader's neighbour fixers, agreed with VanillaFlattening):
 `{"format": 1, "blocks": {"<ns>:<name>": {"*": shape, "<meta>": shape}}}` with shape `{"fullCube": renderAsNormalBlock,
