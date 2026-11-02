@@ -1,10 +1,11 @@
-"""`gtnh-client` command line: prepare / run / export / coverage / screens."""
+"""`gtnh-client` command line: prepare / run / play / export / cameras / coverage / screens."""
 
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -12,7 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from gtnh_client import coverage
+from gtnh_client import cameras, coverage, states
 from gtnh_client.proxy import DelayProxy
 from gtnh_client.download import DownloadError
 from gtnh_client.instance import Layout, PrepareError, ensure_downloads, prepare
@@ -295,6 +296,166 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_cameras(args: argparse.Namespace) -> int:
+    """Reference screenshots of a scene world: restore it on the server, join with the client in the exporter mod's
+    `cameras` mode, check the outputs, stop the server."""
+    started_wall = time.time()
+    t0 = time.monotonic()
+    ws = workspace()
+    scene_dir = ws / "out" / "oracle" / args.variant / "worlds" / args.scene
+    cameras_file = (args.cameras or scene_dir / "cameras.json").resolve()
+    out = (args.out or scene_dir / "client").resolve()
+    data = cameras.read_cameras(cameras_file)
+    if data["scene"] != args.scene:
+        raise CliError(f"{cameras_file} is for scene {data['scene']}, not {args.scene}")
+    for path in [*args.resource_pack, *args.extra_mod]:
+        if not path.exists():
+            raise CliError(f"{path} does not exist")
+    if args.mod_jar and not args.mod_jar.is_file():
+        raise CliError(f"--mod-jar {args.mod_jar} does not exist")
+    server_dir = ws / "servers" / args.server_dir
+    password_file = server_dir / ".rcon-password"
+    if not password_file.is_file():
+        raise CliError(f"{password_file} does not exist (see the orchestrator README)")
+    orch_checkout = ws / "orchestrator"
+    if not (orch_checkout / "pyproject.toml").is_file():
+        raise CliError(f"orchestrator checkout not found at {orch_checkout}")
+    world = data.get("world", args.scene)
+    if not args.running_server and not (ws / "worlds" / world).is_dir():
+        raise CliError(f"scene world {ws / 'worlds' / world} does not exist; build it with `uv run orch scene {args.scene}`")
+
+    mod_jar = args.mod_jar.resolve() if args.mod_jar else build_exporter_mod()
+    layout = make_layout(args.client_dir)
+    if not layout.client_dir.exists():
+        prepare(layout, default_zip())
+    out.mkdir(parents=True, exist_ok=True)
+    cameras.clean_outputs(out, data)
+    spec = cameras.build_spec(
+        data, rcon_port=args.rcon_port, password_file=password_file, view_distance=cameras.server_view_distance(server_dir)
+    )
+    spec_file = cameras.write_spec(spec, out)
+    orch = cameras.Orchestrator(
+        orch_checkout, args.server_dir, args.port, args.rcon_port, level=cameras.LEVEL_PREFIX + args.scene,
+        level_type=data.get("levelType", "FLAT"),
+    )
+    t_build = time.monotonic()
+    t_server = t_client = t_build
+    started_server = False
+    froze_ticks = False
+    proxy = None
+    code = 1
+    try:
+        if not args.running_server:
+            if orch.running():
+                raise CliError(f"a server is already running in {server_dir}; stop it (`uv run orch stop`) or pass --running-server")
+            orch.run("restore", world)
+            started_server = True  # stop and delete the level even if the start fails half-way
+            orch.run("start")
+        # No random ticks while the player is near the scene: the world stays as dumped (no grass spread, crop
+        # growth, leaf decay), and blocks whose random tick crashes on zoo metas (Binnie Botany soil) stay quiet.
+        orch.run("bmh", "random-ticks", "off")
+        froze_ticks = True
+        orch.remove_blocks(data.get("remove") or [])  # states the client cannot render (scene `oracle.exclude`)
+        t_server = time.monotonic()
+        host, port = "127.0.0.1", args.port
+        if args.connect_delay > 0:
+            proxy = DelayProxy(host, port, args.connect_delay).start()  # Forge's login race, see gtnh_client.proxy
+            port = proxy.port
+        jvm_args = [
+            "-Dbluemap.gtnh.exporter.mode=cameras",
+            f"-Dbluemap.gtnh.exporter.cameras={spec_file}",
+            f"-Dbluemap.gtnh.exporter.out={out}",
+        ]
+        with cameras.capture_settings(layout.minecraft_dir):
+            code = run_client(
+                layout, mods=[mod_jar], jvm_args=jvm_args, xmx=args.xmx, timeout=args.timeout, username=cameras.USERNAME,
+                log=args.log, extra_mods=[p.resolve() for p in args.extra_mod],
+                resource_packs=[p.resolve() for p in args.resource_pack], game_args=["--server", host, "--port", str(port)],
+            )
+        t_client = time.monotonic()
+    finally:
+        if proxy:
+            proxy.close()
+        if started_server:
+            orch.run("stop", check=False)
+            orch.run("delete-level", check=False)
+        elif froze_ticks:
+            orch.run("bmh", "random-ticks", "on", check=False)
+    t_end = time.monotonic()
+    split = (
+        f"build {t_build - t0:.0f}s, server restore+start {t_server - t_build:.0f}s, "
+        f"client boot+join+captures {t_client - t_server:.0f}s, server stop {t_end - t_client:.0f}s"
+    )
+    report_file = out / cameras.REPORT
+    if report_file.is_file() and report_file.stat().st_mtime >= started_wall:
+        report = json.loads(report_file.read_text(encoding="utf-8"))
+        for result in report.get("results", []):
+            state = "captured" if result.get("captured") else f"FAILED: {result.get('error')}"
+            flags = "" if not result.get("captured") else (
+                ("" if result.get("settled") else ", NOT settled") + ("" if result.get("stable") else ", NOT stable")
+            )
+            print(f"[cameras] {result['name']}: {state}{flags} ({result.get('seconds', 0):.0f}s)")
+        if report.get("error"):
+            print(f"[cameras] client error: {report['error']}", file=sys.stderr)
+    problems = cameras.check_outputs(out, data, started_wall)
+    if code != 0 or problems:
+        print(f"[cameras] FAILED (client exit {code}): {'; '.join(problems) or 'see the client log'} ({split})", file=sys.stderr)
+        return code or 1
+    print(f"[cameras] OK: {len(data['cameras'])} cameras in {t_end - t0:.0f}s total ({split}); outputs in {out}")
+    return 0
+
+
+def cmd_states(args: argparse.Namespace) -> int:
+    """Reference renders of every block state for the per-state oracle: write the state list (vanilla from the
+    fork's flattening table, modded from the pack's `gtnh/blocks.ndjson`), run the client in the exporter mod's
+    `states` mode, check the outputs."""
+    started_wall = time.time()
+    t0 = time.monotonic()
+    ws = workspace()
+    variant_dir = ws / "out" / "oracle" / args.variant / "states"
+    out = (args.out or variant_dir / "client").resolve()
+    pack = (args.states_from or ws / "out" / "exporter" / RESOURCES_ZIP).resolve()
+    for path in [pack, *args.resource_pack, *args.extra_mod]:
+        if not path.exists():
+            raise CliError(f"{path} does not exist")
+    if args.mod_jar and not args.mod_jar.is_file():
+        raise CliError(f"--mod-jar {args.mod_jar} does not exist")
+    flattening = bluemap_repo() / states.FLATTENING_TSV
+    mod_jar = args.mod_jar.resolve() if args.mod_jar else build_exporter_mod()
+    t_build = time.monotonic()
+    layout = make_layout(args.client_dir)
+    if not layout.client_dir.exists():
+        prepare(layout, default_zip())
+    if out.exists() and not args.only:
+        shutil.rmtree(out)  # a full run starts clean: images of states that are no longer listed must not survive
+    out.mkdir(parents=True, exist_ok=True)
+    states_file = out.parent / ("states.txt" if not args.only else "states-only.txt")
+    count = states.write_states(pack, flattening, states_file, args.only)
+    if count == 0:
+        raise CliError(f"no state matches --only {args.only!r}")
+    print(f"[states] {count} states from {flattening.name} and {pack.name} -> {states_file}", flush=True)
+    jvm_args = [
+        "-Dbluemap.gtnh.exporter.mode=states",
+        f"-Dbluemap.gtnh.exporter.out={out}",
+        f"-Dbluemap.gtnh.exporter.states={states_file}",
+    ]
+    code = run_client(
+        layout, mods=[mod_jar], jvm_args=jvm_args, xmx=args.xmx, timeout=args.timeout, username="BlueMapExporter",
+        log=args.log, extra_mods=[p.resolve() for p in args.extra_mod],
+        resource_packs=[p.resolve() for p in args.resource_pack],
+    )
+    t_run = time.monotonic()
+    split = f"build {t_build - t0:.0f}s, client boot+render {t_run - t_build:.0f}s"
+    problems, summary = states.check_outputs(out, count, started_wall)
+    if code != 0 or problems:
+        print(f"[states] FAILED (client exit {code}): {'; '.join(problems) or 'see the client log'} ({split})", file=sys.stderr)
+        return code or 1
+    print(f"[states] OK: {summary['states']} states ({summary['errors']} with errors, {summary['blank']} blank, "
+          f"{summary['tesr']} with a TESR), render {summary['seconds']:.0f}s, {t_run - t0:.0f}s total ({split}); "
+          f"outputs in {out}")
+    return 0
+
+
 def _join_dash_values(argv: list[str]) -> list[str]:
     """Let `--jvm-arg -Dfoo=bar` work: argparse would otherwise treat the value as an option."""
     joined: list[str] = []
@@ -354,6 +515,39 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this export only; repeatable")
     p.add_argument("--pack-suffix", help="output pack name suffix: bluemap-gtnh-resources-<version>-<suffix>.zip")
     p.set_defaults(func=cmd_export)
+
+    p = sub.add_parser("cameras", help="reference screenshots of a scene world for the world-scene oracle (e2e oracle world)")
+    client_dir_arg(p)
+    p.add_argument("--scene", required=True, help="scene name (e2e scenes/<scene>.yaml, worlds/<scene>)")
+    p.add_argument("--variant", default="default", help="oracle variant, only for the default paths (default %(default)s)")
+    p.add_argument("--cameras", type=Path, help="camera list (default WS/out/oracle/<variant>/worlds/<scene>/cameras.json, written by `e2e oracle world`)")
+    p.add_argument("--out", type=Path, help="output dir (default WS/out/oracle/<variant>/worlds/<scene>/client)")
+    p.add_argument("--resource-pack", type=Path, action="append", default=[], help="client resource pack enabled for this run only, first = highest priority; repeatable")
+    p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this run only; repeatable")
+    p.add_argument("--mod-jar", type=Path, help="use this exporter jar instead of building it with gradle")
+    p.add_argument("--server-dir", default=f"gtnh-{PACK_VERSION}", help="server directory under WS/servers (default %(default)s)")
+    p.add_argument("--port", type=int, default=25565, help="server port (default %(default)s)")
+    p.add_argument("--rcon-port", type=int, default=25575, help="server RCON port (default %(default)s)")
+    p.add_argument("--running-server", action="store_true", help="use the server already running the scene world (no restore/start/stop)")
+    p.add_argument("--connect-delay", type=float, default=2.0, help="hold the server's first reply this many seconds (Forge login race, see `play`); 0 = direct (default %(default)s)")
+    p.add_argument("--xmx", default="10G", help="client heap size (default %(default)s)")
+    p.add_argument("--timeout", type=float, default=3600, help="kill the client after this many seconds, exit 124 (default %(default)s)")
+    p.add_argument("--log", type=Path, help="client log file (default <client-dir>/logs-launcher/client-<timestamp>.log)")
+    p.set_defaults(func=cmd_cameras)
+
+    p = sub.add_parser("states", help="reference renders of every block state for the per-state oracle (e2e oracle states)")
+    client_dir_arg(p)
+    p.add_argument("--variant", default="default", help="oracle variant, only for the default paths (default %(default)s)")
+    p.add_argument("--out", type=Path, help="output dir (default WS/out/oracle/<variant>/states/client)")
+    p.add_argument("--states-from", type=Path, help=f"exported pack whose gtnh/blocks.ndjson lists the modded states (default WS/out/exporter/{RESOURCES_ZIP})")
+    p.add_argument("--only", help="only states whose '<modid:name> <meta>' matches this regex (keeps the other outputs)")
+    p.add_argument("--resource-pack", type=Path, action="append", default=[], help="client resource pack enabled for this run only, first = highest priority; repeatable")
+    p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this run only; repeatable")
+    p.add_argument("--mod-jar", type=Path, help="use this exporter jar instead of building it with gradle")
+    p.add_argument("--xmx", default="10G", help="client heap size (default %(default)s)")
+    p.add_argument("--timeout", type=float, default=3600, help="kill the client after this many seconds, exit 124 (default %(default)s)")
+    p.add_argument("--log", type=Path, help="client log file (default <client-dir>/logs-launcher/client-<timestamp>.log)")
+    p.set_defaults(func=cmd_states)
 
     def coverage_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("--scene", type=Path, default=ws / "out" / "scenes" / "gtnh-zoo", help="scene output dir with dump.ndjson and scene.json (default %(default)s)")
@@ -484,6 +678,7 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(_join_dash_values(sys.argv[1:] if argv is None else argv))
     try:
         sys.exit(args.func(args))
-    except (CliError, PrepareError, ProfileError, DownloadError, FileNotFoundError, subprocess.CalledProcessError) as e:
+    except (CliError, cameras.CamerasError, states.StatesError, PrepareError, ProfileError, DownloadError,
+            FileNotFoundError, subprocess.CalledProcessError) as e:  # fmt: skip
         print(f"gtnh-client: error: {e}", file=sys.stderr)
         sys.exit(1)

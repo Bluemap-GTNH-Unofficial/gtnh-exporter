@@ -111,6 +111,78 @@ Values that start with `-` work as `--jvm-arg -Dfoo=bar` as well as `--jvm-arg=-
    `<out>/bluemap-gtnh-resources-2.9.0-RC-2.zip` to exist and to be newer than the export start.
    It then prints the total wall time with the build/prepare/run split. Every failure exits non-zero.
 
+### `cameras --scene NAME [--variant default] [--cameras FILE] [--out DIR] [--client-dir DIR] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--server-dir gtnh-2.9.0-RC-2] [--port 25565] [--rcon-port 25575] [--running-server] [--connect-delay 2] [--xmx 10G] [--timeout 3600] [--log FILE]`
+
+Reference screenshots of a scene world for the world-scene oracle. `uv run e2e oracle world` (sibling `e2e/`
+checkout) writes the camera list and runs this command with the variant's flags; it also works on its own once
+`cameras.json` exists.
+
+1. Reads the camera list, default `WS/out/oracle/<variant>/worlds/<scene>/cameras.json` (`--variant` only picks the
+   default paths): `{"format": 1, "scene", "world", "box", "cameras": [{"name", "eye": [x, y, z], "yaw", "pitch",
+   "fov", "width", "height"}]}` with Minecraft angles in degrees (yaw 0 = south, 90 = west; pitch 90 = down) and the
+   vertical FOV. `box` is the scene's dump box; its chunks must be loaded before a camera is captured.
+2. Builds the exporter mod unless `--mod-jar`, and writes `spec.json` into the output directory: the cameras, RCON
+   access (host, port, path of the server's `.rcon-password`), the server's `view-distance` and the settle settings.
+3. Unless `--running-server`: copies `WS/worlds/<world>` into the level folder `oracle-<scene>` of
+   `WS/servers/<server-dir>` and starts the server, both with the sibling orchestrator (`uv run orch --level
+   oracle-<scene> ... restore <world>`, `... start`). It refuses to run if that server is already running. Then turns
+   random ticks off on the server (`orch bmh random-ticks off`, needs the harness with that command): the scene stays
+   as dumped while the player is near it, and blocks whose random tick crashes on zoo metas (Binnie Botany soil)
+   stay quiet. With `--running-server` they are turned back on at the end. Cells listed under `remove` (the e2e
+   scene's `oracle.exclude`: block states whose client rendering throws, which fails their whole chunk's mesh) are
+   then set to air with `bmh set` in one `orch rcon` call; with `--running-server` this edits that server's world.
+4. For this run only (both files restored afterwards): `options.txt` gets `ao:0`, `mipmapLevels:0`,
+   `anisotropicFiltering:1`, `renderDistance:12`, `fboEnable:true`, `fancyGraphics:true`, `clouds:false`,
+   `bobView:false`, `particles:2`, `anaglyph3d:false`, `pauseOnLostFocus:false`; Angelica's
+   `config/angelica-options.json` gets `texture_filter_mode: NONE`, `texel_sampling: NEAREST` and
+   `use_fog_occlusion: false`.
+5. Runs the client (`--resource-pack` and `--extra-mod` installed for this run only, as with `export`) as
+   `BlueMapCamera` with `-Dbluemap.gtnh.exporter.mode=cameras`, `-Dbluemap.gtnh.exporter.cameras=<spec.json>`,
+   `-Dbluemap.gtnh.exporter.out=<out>` and `--server` through the login delay proxy of `play`.
+6. Stops the server and deletes `oracle-<scene>` again, prints each camera's result and the wall time split (build,
+   server restore and start, client boot and join and captures, server stop). Exit 1 if a camera failed or an
+   output is missing or older than the run.
+
+The mod's camera mode (`oracle/CameraCapture.kt`) switches the player to creative flight over RCON, sets noon and
+clear weather, then per camera: `tp`s the player there over RCON, pins position and rotation on the client every
+tick and frame, waits until every chunk of the scene box within the view distance is loaded and Angelica's chunk
+renderer reports no pending work (`isTerrainRenderComplete`, else vanilla's update list) for 60 ticks, then until 3
+frames 10 ticks apart differ in at most 0.05 % of the pixels, and captures the next frame. Capture conditions: game
+framebuffer resized to the camera size (the minimized window is not touched), no GUI, hand or block outline; flat
+lighting with a white lightmap (full brightness; vanilla's face shade 1.0 up, 0.5 down, 0.8 north/south, 0.6
+west/east stays); fog pushed beyond the far plane; FOV exactly the camera's (the flying FOV boost cancelled); block
+atlas animations pinned to their first frame.
+
+Outputs (`--out`, default `WS/out/oracle/<variant>/worlds/<scene>/client/`): `<view>.png`; `<view>.depth.bin`
+(float32 little endian, rows top to bottom, OpenGL window depth 0..1, 1 = nothing drawn); `<view>.json` with the
+projection and modelview matrices (column-major, read at `RenderWorldLastEvent`; world to eye is
+`modelview * translate(-camera)`), the camera position, the settle and stability record and timings;
+`cameras-report.json`; `spec.json`.
+
+### `states [--variant default] [--out DIR] [--states-from PACK] [--only REGEX] [--client-dir DIR] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--xmx 10G] [--timeout 3600] [--log FILE]`
+
+Reference renders of every block state for the per-state rendering oracle (`uv run e2e oracle states` in the
+sibling `e2e/` checkout compares them with BlueMap; the e2e README has the whole procedure).
+
+1. Builds the exporter mod unless `--mod-jar`; prepares the client directory if it does not exist.
+2. Writes the state list `WS/out/oracle/<variant>/states/states.txt` (`<modid:name> <meta>` lines): the vanilla
+   states that Mojang's 1.13 flattening table knows (`registered = 1` in the BlueMap fork's
+   `legacy/.../flattening_1_7_10.tsv`, air excluded), then every state of the exported pack's `gtnh/blocks.ndjson`
+   (`--states-from`, default `WS/out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip`: the exporter's own state
+   discovery, whatever the export result). `--only` keeps the states whose `<modid:name> <meta>` matches and writes
+   `states-only.txt` instead; without it the output directory is emptied first.
+3. Runs the client (`--resource-pack` and `--extra-mod` installed for this run only, as with `export`) with
+   `-Dbluemap.gtnh.exporter.mode=states`, `-Dbluemap.gtnh.exporter.states=<list>` and
+   `-Dbluemap.gtnh.exporter.out=<out>` (default `WS/out/oracle/<variant>/states/client/`). The mod draws the states
+   at the main menu and quits (see the exporter README, "Per-state oracle").
+4. Requires `<out>/index.json` newer than the run with one entry and one image per listed state; prints the
+   counts of states with render errors, blank states and states with a tile-entity special renderer.
+
+Variants: `default` as above; `modernity` with `--client-dir WS/clients/gtnh-modernity --resource-pack
+WS/downloads/modernity/Modernity-2.9.x-<sha>.zip --extra-mod WS/downloads/modernity/MyCTMLib-<v>-29x.jar --variant
+modernity`; `addons` with `--client-dir WS/clients/gtnh-addons --states-from WS/out/exporter-addons/<addons zip>
+--extra-mod <addon jar>... --variant addons`. 62,770 states take about 65 s (33 s drawing).
+
 ## Layout
 
 ```
@@ -153,4 +225,8 @@ Boot milestones in the log:
 - os/arch rule evaluation,
 - native classifier resolution and classpath order, from the real patches read out of the instance zip
   (these tests are skipped when the zip is absent),
-- the offline UUID, checked against Java's `UUID.nameUUIDFromBytes`.
+- the offline UUID, checked against Java's `UUID.nameUUIDFromBytes`,
+- `cameras`: camera list validation, the spec, `view-distance`, the capture settings (written and restored, also on
+  errors) and the output checks.
+- `states`: the state list (vanilla from the flattening table, then the pack's `gtnh/blocks.ndjson`, `--only`) and the
+  output checks.

@@ -15,8 +15,6 @@ the answer as a BlueMap resource pack, plus `launcher/`, the `gtnh-client` comma
 the export unattended. The exported pack contains textures of the pack's mods: use it on your own server, but do not
 redistribute it.
 
-![Part of the gtnh-zoo test scene, rendered with the exported pack](https://raw.githubusercontent.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH/main/docs/images/gtnh-zoo.jpg)
-
 The mod (`bluemap-gtnh-exporter`) is a Forge 1.7.10 client mod (Kotlin, GTNHGradle `modern` = Java 25 bytecode, package
 `de.bluecolored.bluemap.gtnh.exporter`, modid `bluemapgtnhexporter`) for GT New Horizons 2.9.0-RC-2. Once the
 client has loaded (20 client ticks after the first screen opens, i.e. the main menu), it exports the appearance of
@@ -49,6 +47,13 @@ System properties (the launcher sets them): `bluemap.gtnh.exporter.out` (output 
 (file of `<modid:name> <meta>` lines, e.g. from world scans; the meta is the last token), `bluemap.gtnh.exporter.stay=true`
 (keep the client open), `bluemap.gtnh.exporter.skipBlocks=true` (GregTech dump only), `bluemap.gtnh.exporter.packSuffix=<s>`
 (output `bluemap-gtnh-resources-2.9.0-RC-2-<s>.zip`).
+
+Modes (`bluemap.gtnh.exporter.mode`): `export` (default, everything in this README except the oracle sections),
+`states` (renders every listed block state in isolation for the per-state rendering oracle, `oracle/StateCapture.kt`;
+properties `bluemap.gtnh.exporter.states` (state list) and `.out`; see [Per-state oracle](#per-state-oracle-states-mode)
+and the launcher README `states`), `cameras` (joins a scene server and captures camera views for the world oracle,
+`oracle/CameraCapture.kt`; properties `bluemap.gtnh.exporter.cameras` (spec JSON) and `.out`; see launcher README
+`cameras`).
 
 Alternative textures: `export --resource-pack <zip|dir> [--extra-mod <jar>] --pack-suffix <s> --out <dir>`
 enables the packs (first = highest priority) and mods for that run only; `mods/` and `options.txt` `resourcePacks` are
@@ -132,6 +137,45 @@ the scene's dump box, packs = both addons + the zip), force-renders with `-Dblue
 matching variant, first variant drawn) / `no_blockstate` / `no_variant` / `missing_model`), then compares with the scene's
 `dump.ndjson`: per mod, distinct non-vanilla placed `(name, meta)` and how many rendered with their own model, plus the
 exporter result of each → `coverage/coverage.json`.
+
+## Per-state oracle (`states` mode)
+
+`uv run gtnh-client states` (launcher README) runs the mod with `bluemap.gtnh.exporter.mode=states`: instead of
+exporting, it draws every block state of the list file `bluemap.gtnh.exporter.states` (`<modid:name> <meta>` lines)
+the way the real client draws it, as the reference of the per-state rendering oracle (`e2e oracle states` in the
+sibling e2e checkout compares it with BlueMap). `oracle/StateCapture.kt`:
+
+- Each state stands alone in `FakeWorld` at (0, 64, 0) with air around, plains, noon, its tile entity from
+  `createTileEntity`. GregTech machines are listed with the MTE id as meta (the exporter's item damage); they are
+  placed with the MTE's base type as block meta and a tile entity built the way GT places one (`StateGregTech`).
+- While drawing, `Minecraft.theWorld` is a `WorldClient` without a connection that answers from the fake world
+  (`StateWorldClient`; Chisel's CTM renderer reads neighbour metadata through it and otherwise throws), and
+  `thePlayer`/`renderViewEntity` a player without a connection near the camera (tile-entity renderers read it).
+- The block: quads of `RenderBlocks.renderBlockByRenderType` (fresh `RenderBlocks` per state, `renderAllFaces`
+  false), captured with GTNHLib per render pass as `canRenderInPass` allows and drawn with the terrain GL state of
+  `EntityRenderer.renderWorld`: pass 0 unblended with alpha test 0.5, pass 1 blended (`770, 771, 1, 0`) without
+  depth writes. Then the tile-entity special renderer (`renderTileEntityAt` at the block, passes 0 and 1 as
+  `shouldRenderInPass` allows, standard item lighting, as `RenderGlobal.renderEntities`).
+- Conditions: lightmap filled white (full brightness), ambient occlusion off (vanilla's non-AO face shade stays, as
+  drawn by the renderers), fancy graphics, no fog, animated sprites pinned to their first animation frame
+  (`getFrameIndex(0)`), block atlas sampled with `GL_NEAREST` (no mipmaps).
+- Camera: two orthographic 128 x 128 views side by side in one 256 x 128 image, both looking at the block centre
+  from 30 degrees above: `se` (yaw 45, sees up/south/east) and `nw` (yaw 225, sees up/north/west);
+  `glOrtho(-1, 1, -1, 1, -10, 10)` = 2 blocks across, 64 pixels per block (`StateViews`).
+- Every state is drawn three times into a 2048 x 1024 framebuffer, 64 states at a time: over opaque black, over
+  opaque white (visual alpha `a = 1 - (white - black)`, colour `black / a`, whatever blend functions the renderers
+  use), and once with depth writes in every pass. Face IDs come from that depth buffer: per pixel and axis the
+  one-sided depth difference whose continuation is flat (so pixels next to an edge use their own face), the plane
+  normal, then `1 down, 2 up, 3 north, 4 south, 5 west, 6 east` if one axis component is at least 0.95, else `7`
+  (other); `0` = nothing drawn (`StateImages`).
+
+Output (`bluemap.gtnh.exporter.out`): `<ns>/<value>/<meta>.png` (straight-alpha RGBA), `<ns>/<value>/<meta>.faces.png`
+(8-bit palette PNG of face IDs) with `(ns, value)` = `ResourceKeys.normalizeRegistryName(name)`, and `index.json`:
+camera, conditions, render seconds and per state `key` (`<ns>:<value>[meta=<meta>]`), `name`, `meta`, `path`,
+`renderType`, `class`, `passes`, `quads`, `tileEntity`, `te` (base64 of the tile entity's uncompressed NBT; `teError`
+if it could not be written, BlueMap then gets no tile entity), `tesr`, `blank` (nothing drawn), `worldMeta`/`mte`
+(GregTech machines), `glError` and `error` (render exceptions; the state is still written). 62,770 states take 33 s
+plus the client boot.
 
 ## GregTech dump (gtnh/gregtech/)
 
