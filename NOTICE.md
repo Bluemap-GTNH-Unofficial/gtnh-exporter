@@ -27,5 +27,8 @@ The jar shades nothing; the GT New Horizons pack provides these at run time.
 ## Textures
 
 The exported resource pack contains textures of Minecraft and of the installed mods, which belong to their authors.
-It is built on the user's machine from the user's own copy of the pack and is never published by this project.
+For convenience, the umbrella repository's releases attach one ready pack for GT New Horizons 2.9.0 (the base pack
+plus the five supported community addons). It is offered for non-commercial use only; rights holders can request
+removal with the [takedown form](https://github.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH/issues/new?template=takedown.yml),
+and it is removed promptly. Any other pack is built on the user's machine from the user's own copy of the pack.
 The launcher downloads Mojang's client jar, libraries and assets from Mojang for local use only.

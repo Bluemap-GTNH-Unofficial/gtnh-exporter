@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-USER_AGENT = "gtnh-client/0.1 (BlueMap-GTNH launcher)"
+USER_AGENT = "gtnh-client/0.2 (BlueMap-GTNH launcher)"
 _CHUNK = 1 << 20
 
 
