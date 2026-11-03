@@ -16,8 +16,8 @@ the export unattended. The exported pack contains textures of the pack's mods: u
 redistribute it.
 
 The mod (`bluemap-gtnh-exporter`) is a Forge 1.7.10 client mod (Kotlin, GTNHGradle `modern` = Java 25 bytecode, package
-`de.bluecolored.bluemap.gtnh.exporter`, modid `bluemapgtnhexporter`) for GT New Horizons 2.9.0 (2.9.0-RC-2 is tested
-too; the same jar runs on both). Once the
+`de.bluecolored.bluemap.gtnh.exporter`, modid `bluemapgtnhexporter`) for GT New Horizons 2.9.0, the only supported
+and tested version. Once the
 client has loaded (20 client ticks after the first screen opens, i.e. the main menu), it exports the appearance of
 every registered non-`minecraft` block into a BlueMap resource pack, then quits the game (exit 0; exit 1 if the
 export threw). Vanilla blocks are rendered from the 1.13 client jar and are not exported.
@@ -39,9 +39,9 @@ the Mojang/Forge/LWJGL3 libraries and assets (cache `WS/downloads/mc-cache`), st
 - `bluemap-gtnh-resources-2.9.0.zip` — drop into BlueMap's `packs/` (with the `gtnh-render` and `legacy` addons),
 - `export-report.json` — per-mod counts (also inside the zip as `gtnh/export-report.json`).
 
-For 2.9.0-RC-2 add `--pack-version 2.9.0-RC-2` (client `WS/clients/gtnh-2.9.0-RC-2`, output `WS/out/exporter/`,
-scene dumps in `WS/out/scenes/`): per-version workspace directories end in `-<version>`, and 2.9.0-RC-2, the first
-version tested, keeps the unversioned ones.
+The pack version (`--pack-version`, only `2.9.0`, the default) picks the per-version workspace directories, which end
+in `-<version>`; the launcher refuses a client whose own version (`dreamcraft.cfg` `ModPackVersion`) differs from it.
+The export takes about 51 s of client run time: 4,087 blocks, 61,468 states from 138 mods.
 
 Build alone: `mise exec java@temurin-25.0.5+8.0.LTS -- ./gradlew -Porg.gradle.java.installations.paths=$(mise where java@zulu-8.98.0.107)/Contents/Home,$(mise where java@temurin-25.0.5+8.0.LTS)/Contents/Home build`
 (Kotlin Gradle plugin forced to 2.3.21 in `settings.gradle.kts`). The resource-key normalization
@@ -68,13 +68,18 @@ enables the packs (first = highest priority) and mods for that run only; `mods/`
 restored afterwards. Example: `--resource-pack ../../downloads/modernity/Modernity-2.9.x-fa35a3d.zip --extra-mod
 ../../downloads/modernity/MyCTMLib-1.4.3-29x.jar --pack-suffix modernity --out ../../out/modernity`.
 
-Community addons (jars and hashes in `WS/downloads/addons/versions.json`: TST, GTNL with GTNLLib, PH, NHU, Box++): a
-separate client `WS/clients/gtnh-addons-2.9.0` (`prepare --client-dir`), whose `config/GregTech/GregTech.cfg` has
-`crashOnNullRecipeInput=false` (see the orchestrator README), then
+Community addons (jars and hashes in `WS/downloads/addons/versions.json`, keyed by pack version, `packs.<version>.addons`):
+Twist Space Technology (TST) 0.8.0, GT: Not Leisure (GTNL) 0.2.7-rc2.1 with its required GTNLLib 1.1.3, Programmable
+Hatches (PH) 0.2.1p2, NH Utilities (NHU) 1.7.0 and the Box++ community fork 2.2.0.0. 123Technology is unsupported until
+an upstream 2.9.0 release (2.2.0.1 stops a 2.9.0 server with `NoSuchFieldError` `TEC_MARK_EM`). They use a separate client
+`WS/clients/gtnh-addons-2.9.0` (`prepare --client-dir`), whose `config/GregTech/GregTech.cfg` has
+`crashOnNullRecipeInput=false` (the only config workaround: TST builds a recipe from the empty `craftingBlastFurnace`
+ore entry; see the orchestrator README), then
 `export --client-dir WS/clients/gtnh-addons-2.9.0 --out WS/out/exporter-addons-2.9.0 --pack-suffix addons --extra-mod <jar>...`
 with `--extra-states-dump` of `gtnh-zoo`, `addons-zoo`, `addons-machines` and `addons-multiblocks`
-(`WS/out/scenes-2.9.0/<scene>/dump.ndjson`). The GT dump then holds every addon MTE and the addon casing texture pages
-(31, 114, 115, 116) with no exporter change.
+(`WS/out/scenes-2.9.0/<scene>/dump.ndjson`), which writes `bluemap-gtnh-resources-2.9.0-addons.zip`. The GT dump then
+holds every addon MTE and the addon casing texture pages (31, 114, 115, 116) with no exporter change (on 2.9.0: 4,450
+of 4,450 MTEs, 580 casings, 0 errors).
 
 Placeholder icons (`missingno`, Forge `MISSING_ICON_BLOCK_*`, Angelica `error_block_*`, which Angelica returns instead of
 null icons) count as missing: probed metas with only placeholders are dropped, cubes need real icons, and a capture that
@@ -146,8 +151,7 @@ uv run gtnh-client coverage      # builds :cli:shadowJar :legacy:addonJar :gtnh-
 uv run gtnh-client screens       # serves that render on 127.0.0.1:8210, Playwright/Chromium screenshots -> WS/out/exporter-2.9.0/screens
 ```
 
-`coverage` writes a CLI config to `WS/out/exporter-2.9.0/coverage/config` (2.9.0-RC-2, `--pack-version 2.9.0-RC-2`:
-`WS/worlds/` and `WS/out/exporter/`; map with `loader: "gtnh:anvil_1_7"`, render mask =
+`coverage` writes a CLI config to `WS/out/exporter-2.9.0/coverage/config` (map with `loader: "gtnh:anvil_1_7"`, render mask =
 the scene's dump box, packs = both addons + the zip), force-renders with `-Dbluemap.gtnh.coverageReport=<file>`
 (`gtnh-render` `CoverageReport`: every distinct state BlueMap computes properties for is classified `ok` / `fallback` (no
 matching variant, first variant drawn) / `no_blockstate` / `no_variant` / `missing_model`), then compares with the scene's
@@ -190,8 +194,8 @@ Output (`bluemap.gtnh.exporter.out`): `<ns>/<value>/<meta>.png` (straight-alpha 
 camera, conditions, render seconds and per state `key` (`<ns>:<value>[meta=<meta>]`), `name`, `meta`, `path`,
 `renderType`, `class`, `passes`, `quads`, `tileEntity`, `te` (base64 of the tile entity's uncompressed NBT; `teError`
 if it could not be written, BlueMap then gets no tile entity), `tesr`, `blank` (nothing drawn), `worldMeta`/`mte`
-(GregTech machines), `glError` and `error` (render exceptions; the state is still written). 62,770 states take 33 s
-plus the client boot.
+(GregTech machines), `glError` and `error` (render exceptions; the state is still written). On 2.9.0, 62,659 states
+take 32 s plus the client boot.
 
 ## GregTech dump (gtnh/gregtech/)
 
@@ -230,7 +234,7 @@ a copied block is resolved to its icon for that side. Layer objects (`type`):
   - `iconError`: `Block.getIcon` threw. The casing points at an unused meta, so GT would fail to render it too.
 - `"background"`: placeholder for a hatch's casing background, used only in `mte.json` `hatch.front`.
 - `"unknown"`: `{type, class, icon?, key?, rgba?}`, for an ITexture implementation without a descriptor.
-  None occurs in 2.9.0-RC-2.
+  None occurs on 2.9.0 (with or without the addons).
 
 UV orientation (`GTRenderedTexture`, world rendering):
 - Faces use vanilla `RenderBlocks.renderFace*` with `field_152631_f = true` on the north and east faces, i.e. the
