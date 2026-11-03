@@ -3,6 +3,7 @@ package de.bluecolored.bluemap.gtnh.exporter.oracle
 import com.google.gson.JsonArray
 import com.google.gson.JsonObject
 import com.google.gson.JsonParser
+import com.google.gson.JsonPrimitive
 import cpw.mods.fml.common.FMLCommonHandler
 import cpw.mods.fml.common.Loader
 import cpw.mods.fml.common.eventhandler.EventPriority
@@ -14,6 +15,8 @@ import de.bluecolored.bluemap.gtnh.exporter.PackWriter
 import net.minecraft.client.Minecraft
 import net.minecraft.client.gui.GuiDisconnected
 import net.minecraft.client.gui.GuiDownloadTerrain
+import net.minecraft.client.gui.GuiMainMenu
+import net.minecraft.client.gui.GuiScreen
 import net.minecraft.client.renderer.ActiveRenderInfo
 import net.minecraft.client.renderer.EntityRenderer
 import net.minecraft.client.renderer.OpenGlHelper
@@ -24,17 +27,30 @@ import net.minecraft.client.renderer.texture.TextureAtlasSprite
 import net.minecraft.client.renderer.texture.TextureMap
 import net.minecraft.client.renderer.texture.TextureUtil
 import net.minecraft.client.resources.data.AnimationMetadataSection
+import net.minecraft.command.ICommandSender
+import net.minecraft.entity.EntityTracker
+import net.minecraft.server.MinecraftServer
+import net.minecraft.server.management.PlayerManager
+import net.minecraft.server.management.ServerConfigurationManager
+import net.minecraft.util.ChatComponentText
+import net.minecraft.util.ChunkCoordinates
+import net.minecraft.util.IChatComponent
+import net.minecraft.util.Timer
+import net.minecraft.world.World
+import net.minecraft.world.WorldServer
 import net.minecraft.world.chunk.EmptyChunk
 import net.minecraftforge.client.event.EntityViewRenderEvent
 import net.minecraftforge.client.event.FOVUpdateEvent
 import net.minecraftforge.client.event.RenderHandEvent
 import net.minecraftforge.client.event.RenderWorldLastEvent
 import net.minecraftforge.common.MinecraftForge
+import net.minecraftforge.event.world.WorldEvent
 import org.lwjgl.BufferUtils
 import org.lwjgl.opengl.GL11
 import org.lwjgl.opengl.GL30
 import java.awt.image.BufferedImage
 import java.io.File
+import java.lang.management.ManagementFactory
 import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.nio.ByteBuffer
@@ -43,6 +59,7 @@ import java.nio.FloatBuffer
 import java.util.Collections
 import java.util.IdentityHashMap
 import java.util.Locale
+import java.util.concurrent.ConcurrentLinkedQueue
 import javax.imageio.ImageIO
 import kotlin.math.abs
 import kotlin.math.floor
@@ -50,38 +67,45 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * `-Dbluemap.gtnh.exporter.mode=cameras`: reference screenshots of a scene world for the world-scene oracle
- * (`e2e oracle world`). The client is started with `--server` pointing at a server that runs the scene world;
- * `gtnh-client cameras` sets everything up.
+ * `-Dbluemap.gtnh.exporter.mode=cameras`: reference screenshots of scene worlds for the world-scene oracle
+ * (`e2e oracle world`); `gtnh-client cameras --jobs` sets everything up.
  *
- * Once in the world it switches the player to creative flight over RCON, then for every camera of the spec:
- * teleports the player there over RCON (`tp`), pins position and rotation on the client every tick and frame, waits
- * until the client has every chunk of the scene box in range and the chunk renderer reports no pending work, waits a
- * settle time, then until consecutive frames stop changing, and captures the next frame in [RenderWorldLastEvent]
- * (before other mods draw overlays, with the hand suppressed so the depth buffer stays intact): colour
- * (`<view>.png`), depth (`<view>.depth.bin`, float32 little endian, rows top to bottom, GL window depth 0..1) and the
- * projection and modelview matrices plus the camera position (`<view>.json`). `cameras-report.json` summarises the
- * run; then the client quits (exit 1 if any camera failed).
+ * The spec lists jobs, each a scene world the launcher copied into `saves/`. From the main menu the client opens each
+ * job's save as a single-player world (integrated server, no dedicated server or RCON), captures its cameras, returns
+ * to the main menu and opens the next save, all in one client session. Before the player joins, the integrated server
+ * runs `bmh random-ticks off` (the harness mod `bmh` is loaded into the client for this; it also keeps the scene's
+ * frozen tile entities unticked), sets the job's `remove` cells to air with `bmh set`, noon, clear weather, no daylight
+ * cycle and no mob spawning. Its chunk radius is the spec's `viewDistance` (the dedicated scene server's), not the
+ * client's render distance.
+ *
+ * Per camera: `tp` on the integrated server, pin position and rotation on the client every tick and frame, wait until
+ * every chunk of the scene box within the view distance has been on the client for `loadTicks` ticks, then freeze the
+ * game (single-player pause behind an invisible screen: no world, entity, tile entity, particle or texture ticks, the
+ * integrated server stops ticking; partial ticks 0, client total world time 0), wait until the chunk renderer reports
+ * no pending work and `stableFrames` frames at least `stableIntervalSeconds` apart agree, and capture that frame in
+ * [RenderWorldLastEvent] (before other mods draw overlays, with the hand suppressed so the depth buffer stays intact):
+ * colour (`<view>.png`), depth (`<view>.depth.bin`, float32 little endian, rows top to bottom, GL window depth 0..1)
+ * and the projection and modelview matrices plus the camera position (`<view>.json`). Each job's
+ * `cameras-report.json` summarises it; after the last job the client quits (exit 1 if any camera or job failed).
  *
  * Capture conditions (see the launcher README): no GUI, hand or block outline; flat lighting (smooth lighting off) with
  * a white lightmap (full brightness everywhere, vanilla's per-face shading 1.0 / 0.8 / 0.6 / 0.5 stays); no fog
- * (pushed beyond the far plane), no clouds, no view bobbing, minimal particles; noon and clear weather; FOV exactly
- * the camera's vertical FOV (the flying FOV boost is cancelled); animated block textures pinned to their first frame,
- * as the e2e captures of the BlueMap webapp do.
+ * (pushed beyond the far plane), no clouds, no view bobbing, no particles (cleared every frame); noon and clear
+ * weather; FOV exactly the camera's vertical FOV (the flying FOV boost is cancelled); animated block textures pinned to
+ * their first frame, as the e2e captures of the BlueMap webapp do.
  *
- * System properties: `bluemap.gtnh.exporter.cameras` (spec JSON written by `gtnh-client cameras`),
- * `bluemap.gtnh.exporter.out` (output directory).
+ * System properties: `bluemap.gtnh.exporter.cameras` (spec JSON written by `gtnh-client cameras`).
  */
 object CameraCapture {
     private val log = ExporterMod.log
 
     private const val EYE_HEIGHT = 1.62 // EntityPlayer.yOffset: the client's posY is the eye, `tp` takes the feet
-    private const val JOIN_SETTLE_TICKS = 40
-    private const val FOV_SETTLE_TICKS = 30 // fovModifierHand eases towards 1.0 by half per tick
+    private const val MENU_TICKS = 20 // at the main menu this long before the first world is opened
+    private const val JOIN_SETTLE_TICKS = 10
     private const val TELEPORT_TIMEOUT_SECONDS = 30.0
-    private const val STABILIZE_TIMEOUT_SECONDS = 60.0
     private const val CHANGED_CHANNEL_DELTA = 8
     private const val FOG_DISTANCE = 1.0e6f
+    private const val FROZEN_WORLD_TIME = 0L // client total world time while frozen: animated TESRs at "frame 0"
 
     private class Camera(
         val name: String,
@@ -95,59 +119,112 @@ object CameraCapture {
         val height: Int,
     )
 
-    private class Spec(
+    private class Job(
         val scene: String,
+        val save: String,
         val box: IntArray?,
         val cameras: List<Camera>,
-        val rconHost: String,
-        val rconPort: Int,
-        val rconPasswordFile: File,
-        val viewDistance: Int,
-        val renderDistance: Int,
-        val settleTicks: Int,
-        val stableFrames: Int,
-        val stableIntervalTicks: Int,
-        val stableTolerance: Double,
-        val joinTimeoutSeconds: Double,
-        val cameraTimeoutSeconds: Double,
+        val remove: List<IntArray>,
+        val freezeRandomTicks: Boolean,
+        val outDir: File,
     )
 
-    private enum class Phase { JOINING, SETUP, TELEPORT, SETTLE, STABILIZE, CAPTURE, FINISHED }
+    private class Spec(
+        val jobs: List<Job>,
+        val captureVersion: Int,
+        val viewDistance: Int,
+        val renderDistance: Int,
+        val loadTicks: Int,
+        val stableFrames: Int,
+        val stableIntervalSeconds: Double,
+        val stableTolerance: Double,
+        val worldTimeoutSeconds: Double,
+        val cameraTimeoutSeconds: Double,
+        val stableTimeoutSeconds: Double,
+        val session: File?,
+    )
+
+    private enum class Phase { MENU, JOINING, SETUP, TELEPORT, LOAD, STABILIZE, CAPTURE, LEAVE, FINISHED }
 
     private lateinit var spec: Spec
-    private lateinit var outDir: File
-    private var phase = Phase.JOINING
+    private var phase = Phase.MENU
     private var phaseTicks = 0
     private var phaseStarted = 0L
     private var started = 0L
+    private var menuTicks = 0
+    private var bootSeconds = Double.NaN
+
+    // per job
+    private var jobIndex = -1
+    private var jobStarted = 0L
+    private var jobTimings = JsonObject()
+    private var jobError: String? = null
     private var joinedTicks = 0
     private var index = 0
-    private var cameraStarted = 0L
-    private var pinned: Camera? = null
-    private var rcon: CameraRcon? = null
-    private var playerName = ""
+    @Volatile private var playerName = ""
+    private var results = JsonArray()
+    private var failures = 0
+    private val sessionJobs = JsonArray()
+    private var failedJobs = 0
+
+    @Volatile private var setupDone = false
+    @Volatile private var serverError: String? = null
+    @Volatile private var teleportReply = ""
+    private val serverTasks = ConcurrentLinkedQueue<(MinecraftServer) -> Unit>()
+
+    /** The server's side of the player's chunks: square centre, chunks already sent, chunks still queued. */
+    private class ServerView(val centreX: Int, val centreZ: Int, val sent: LongArray, val queued: Int)
+
+    /** Published by the integrated server thread every tick while a camera waits for chunks. */
+    @Volatile private var serverView: ServerView? = null
+    @Volatile private var probing = false
+    private var probeTicks = 0 // server thread
 
     // per camera
-    private var readySince = -1
-    private var settled = false
-    private var settleSeconds = Double.NaN
-    private var lastChunks = intArrayOf(0, 0, 0)
+    private var cameraStarted = 0L
+    private var pinned: Camera? = null
+    private var loadedTicks = 0
+    private var loadSeconds = Double.NaN
+    private var lastChunks = intArrayOf(0, 0, 0, 0)
     private var lastTerrain: Boolean? = null
-    private var snapshotRequested = false
-    private var captureRequested = false
+    private var frozen = false
+    private var frozenFrames = 0
     private var lastSnapshot: ByteArray? = null
+    private var lastSnapshotAt = 0L
     private var stableCount = 0
     private var changes = mutableListOf<Double>()
-    private var teleportReply = ""
+    private var frames = 0
+    private var captureRequested = false
+    private var stableTimedOut = false
 
-    private val results = JsonArray()
-    private var failures = 0
     private val frozenSprites: MutableSet<TextureAtlasSprite> = Collections.newSetFromMap(IdentityHashMap())
+
+    /** Pauses a single-player game (`doesGuiPauseGame`) and draws nothing. */
+    private object FreezeScreen : GuiScreen() {
+        override fun doesGuiPauseGame() = true
+        override fun drawScreen(mouseX: Int, mouseY: Int, partialTicks: Float) {}
+        override fun keyTyped(typedChar: Char, keyCode: Int) {}
+    }
+
+    /** Runs server commands with full permissions and keeps their replies. */
+    private class Sender(private val server: MinecraftServer) : ICommandSender {
+        val replies = mutableListOf<String>()
+        override fun getCommandSenderName() = "BlueMapOracle"
+        override fun func_145748_c_(): IChatComponent = ChatComponentText(commandSenderName)
+        override fun addChatMessage(message: IChatComponent) {
+            replies += message.unformattedText
+        }
+        override fun canCommandSenderUseCommand(permissionLevel: Int, command: String) = true
+        override fun getPlayerCoordinates() = ChunkCoordinates(0, 0, 0)
+        override fun getEntityWorld(): World = server.entityWorld
+    }
 
     private val lightmapTexture: Field = ReflectionHelper.findField(EntityRenderer::class.java, "lightmapTexture", "field_78513_d")
     private val lightmapUpdateNeeded: Field =
         ReflectionHelper.findField(EntityRenderer::class.java, "lightmapUpdateNeeded", "field_78536_aa")
     private val fovModifierHand: Field = ReflectionHelper.findField(EntityRenderer::class.java, "fovModifierHand", "field_78507_R")
+    private val fovModifierHandPrev: Field =
+        ReflectionHelper.findField(EntityRenderer::class.java, "fovModifierHandPrev", "field_78506_S")
     private val listAnimatedSprites: Field = ReflectionHelper.findField(TextureMap::class.java, "listAnimatedSprites", "field_94258_i")
     private val frameCounter: Field = ReflectionHelper.findField(TextureAtlasSprite::class.java, "frameCounter", "field_110973_g")
     private val tickCounter: Field = ReflectionHelper.findField(TextureAtlasSprite::class.java, "tickCounter", "field_110983_h")
@@ -157,6 +234,10 @@ object CameraCapture {
     private val ariProjection: Field = ReflectionHelper.findField(ActiveRenderInfo::class.java, "projection", "field_74595_k")
     private val worldRenderersToUpdate: Field =
         ReflectionHelper.findField(RenderGlobal::class.java, "worldRenderersToUpdate", "field_72767_j")
+    private val timer: Field = ReflectionHelper.findField(Minecraft::class.java, "timer", "field_71428_T")
+    private val playersViewDistance: Field =
+        ReflectionHelper.findField(ServerConfigurationManager::class.java, "viewDistance", "field_72402_d")
+    private val entityViewDistance: Field = ReflectionHelper.findField(EntityTracker::class.java, "entityViewDistance", "field_72792_d")
 
     /** Angelica's Celeritas chunk renderer (GTNH's default), looked up by name: no compile-time dependency. */
     private val celeritas: Pair<Method, Method>? by lazy {
@@ -174,52 +255,60 @@ object CameraCapture {
             ?: throw IllegalStateException("camera mode needs -Dbluemap.gtnh.exporter.cameras=<spec.json>")
         spec = readSpec(File(specPath))
         val mc = Minecraft.getMinecraft()
-        outDir = File(System.getProperty("bluemap.gtnh.exporter.out") ?: File(mc.mcDataDir, "bluemap-gtnh-cameras").path).absoluteFile
-        outDir.mkdirs()
         applySettings(mc)
         started = System.nanoTime()
         phaseStarted = started
         FMLCommonHandler.instance().bus().register(this)
         MinecraftForge.EVENT_BUS.register(this)
-        log.info("Camera mode: {} cameras of scene {} -> {}", spec.cameras.size, spec.scene, outDir)
+        log.info("Camera mode: {} jobs, {} cameras", spec.jobs.size, spec.jobs.sumOf { it.cameras.size })
     }
 
     private fun readSpec(file: File): Spec {
         val json = JsonParser().parse(file.readText(Charsets.UTF_8)).asJsonObject
-        val rcon = json.getAsJsonObject("rcon")
-        val cameras = json.getAsJsonArray("cameras").map { element ->
-            val c = element.asJsonObject
-            val eye = c.getAsJsonArray("eye")
-            Camera(
-                name = c.get("name").asString,
-                x = eye[0].asDouble,
-                y = eye[1].asDouble,
-                z = eye[2].asDouble,
-                yaw = c.get("yaw").asFloat,
-                pitch = c.get("pitch").asFloat,
-                fov = c.get("fov").asFloat,
-                width = c.get("width").asInt,
-                height = c.get("height").asInt,
+        val jobs = json.getAsJsonArray("jobs").map { element ->
+            val j = element.asJsonObject
+            val cameras = j.getAsJsonArray("cameras").map { ce ->
+                val c = ce.asJsonObject
+                val eye = c.getAsJsonArray("eye")
+                Camera(
+                    name = c.get("name").asString,
+                    x = eye[0].asDouble,
+                    y = eye[1].asDouble,
+                    z = eye[2].asDouble,
+                    yaw = c.get("yaw").asFloat,
+                    pitch = c.get("pitch").asFloat,
+                    fov = c.get("fov").asFloat,
+                    width = c.get("width").asInt,
+                    height = c.get("height").asInt,
+                )
+            }
+            require(cameras.isNotEmpty()) { "job ${j.get("scene")} has no cameras" }
+            Job(
+                scene = j.get("scene").asString,
+                save = j.get("save").asString,
+                box = j.getAsJsonArray("box")?.map { it.asInt }?.toIntArray(),
+                cameras = cameras,
+                remove = j.getAsJsonArray("remove")?.map { p -> p.asJsonArray.map { it.asInt }.toIntArray() } ?: emptyList(),
+                freezeRandomTicks = j.get("freezeRandomTicks")?.asBoolean ?: true,
+                outDir = File(j.get("out").asString).absoluteFile,
             )
         }
-        require(cameras.isNotEmpty()) { "no cameras in $file" }
+        require(jobs.isNotEmpty()) { "no jobs in $file" }
         fun int(key: String, default: Int) = json.get(key)?.asInt ?: default
         fun double(key: String, default: Double) = json.get(key)?.asDouble ?: default
         return Spec(
-            scene = json.get("scene").asString,
-            box = json.getAsJsonArray("box")?.map { it.asInt }?.toIntArray(),
-            cameras = cameras,
-            rconHost = rcon.get("host").asString,
-            rconPort = rcon.get("port").asInt,
-            rconPasswordFile = File(rcon.get("passwordFile").asString),
+            jobs = jobs,
+            captureVersion = int("captureVersion", 0),
             viewDistance = int("viewDistance", 8),
             renderDistance = int("renderDistance", 12),
-            settleTicks = int("settleTicks", 60),
+            loadTicks = int("loadTicks", 5),
             stableFrames = int("stableFrames", 3),
-            stableIntervalTicks = int("stableIntervalTicks", 10),
+            stableIntervalSeconds = double("stableIntervalSeconds", 0.1),
             stableTolerance = double("stableTolerance", 0.0005),
-            joinTimeoutSeconds = double("joinTimeoutSeconds", 900.0),
-            cameraTimeoutSeconds = double("cameraTimeoutSeconds", 240.0),
+            worldTimeoutSeconds = double("worldTimeoutSeconds", 300.0),
+            cameraTimeoutSeconds = double("cameraTimeoutSeconds", 60.0),
+            stableTimeoutSeconds = double("stableTimeoutSeconds", 30.0),
+            session = json.get("session")?.asString?.let(::File),
         )
     }
 
@@ -233,6 +322,7 @@ object CameraCapture {
         gs.viewBobbing = false
         gs.particleSetting = 2
         gs.pauseOnLostFocus = false
+        gs.showInventoryAchievementHint = false
         gs.hideGUI = true
         gs.fboEnable = true
         gs.anaglyph = false
@@ -247,6 +337,7 @@ object CameraCapture {
     private fun settingsJson(mc: Minecraft) = JsonObject().apply {
         val gs = mc.gameSettings
         addProperty("renderDistanceChunks", gs.renderDistanceChunks)
+        addProperty("viewDistance", spec.viewDistance)
         addProperty("ambientOcclusion", gs.ambientOcclusion)
         addProperty("fancyGraphics", gs.fancyGraphics)
         addProperty("clouds", gs.clouds)
@@ -258,8 +349,12 @@ object CameraCapture {
         addProperty("lightmap", "white (full brightness)")
         addProperty("fog", "pushed to $FOG_DISTANCE blocks")
         addProperty("animations", "block atlas sprites pinned to frame 0")
+        addProperty("particles", "cleared every frame")
+        addProperty("freeze", "single-player pause, partial ticks 0, client total world time $FROZEN_WORLD_TIME")
+        addProperty("world", "single-player (integrated server)")
         addProperty("terrainRenderer", terrainSource)
         Loader.instance().indexedModList["angelica"]?.let { addProperty("angelica", it.version) }
+        Loader.instance().indexedModList["bmh"]?.let { addProperty("bmh", it.version) }
     }
 
     private fun enter(next: Phase) {
@@ -270,16 +365,105 @@ object CameraCapture {
 
     private fun seconds(since: Long) = (System.nanoTime() - since) / 1e9
 
-    private val camera: Camera get() = spec.cameras[index]
+    private val job: Job get() = spec.jobs[jobIndex]
+    private val camera: Camera get() = job.cameras[index]
+    private val inWorld: Boolean get() = phase > Phase.JOINING && phase < Phase.LEAVE
 
-    private fun rconCommand(command: String): String {
-        val client = rcon ?: CameraRcon(spec.rconHost, spec.rconPort, spec.rconPasswordFile.readText().trim()).also { rcon = it }
-        val reply = client.command(command)
-        log.info("RCON {} -> {}", command, reply.trim())
+    private fun fmt(v: Double) = String.format(Locale.ROOT, "%.4f", v) // a '.' keeps `tp` from adding 0.5
+
+    // ---- server side (integrated server thread) ----
+
+    /** Runs on the integrated server thread at the start of its next tick. */
+    private fun onServer(task: (MinecraftServer) -> Unit) {
+        serverTasks += task
+    }
+
+    private fun command(server: MinecraftServer, command: String): String {
+        val sender = Sender(server)
+        server.commandManager.executeCommand(sender, command)
+        val reply = sender.replies.joinToString(" | ")
+        log.info("Server command {} -> {}", command, reply)
         return reply
     }
 
-    private fun fmt(v: Double) = String.format(Locale.ROOT, "%.4f", v) // a '.' keeps `tp` from adding 0.5
+    private fun bmh(server: MinecraftServer, command: String) {
+        val reply = command(server, "bmh $command")
+        check(reply.startsWith("OK")) { "bmh $command: $reply" }
+    }
+
+    @SubscribeEvent
+    fun onServerTick(event: TickEvent.ServerTickEvent) {
+        if (event.phase != TickEvent.Phase.START) return
+        val server = MinecraftServer.getServer() ?: return
+        while (true) {
+            val task = serverTasks.poll() ?: break
+            try {
+                task(server)
+            } catch (t: Throwable) {
+                log.error("Camera capture server task failed", t)
+                serverError = "${t.javaClass.simpleName}: ${t.message}"
+            }
+        }
+        if (probing) probe(server)
+    }
+
+    /**
+     * Publishes [serverView]: the chunks the server has sent the player (watched and no longer queued) and how many it
+     * still has queued. `PlayerManager` moves a player's square only after a move of 8 blocks from its `managedPos`, so
+     * the client waits for exactly what the server sends rather than for a square it computes itself. Logs the server's
+     * side of the transfer every 5 s while a camera waits for chunks.
+     */
+    private fun probe(server: MinecraftServer) {
+        val player = server.configurationManager?.func_152612_a(playerName) ?: return
+        val world = player.worldObj as WorldServer
+        val cx = player.managedPosX.toInt() shr 4
+        val cz = player.managedPosZ.toInt() shr 4
+        val range = spec.viewDistance + 1
+        val sent = ArrayList<Long>()
+        for (x in cx - range..cx + range) for (z in cz - range..cz + range) {
+            if (world.playerManager.isPlayerWatchingChunk(player, x, z)) sent += chunkKey(x, z)
+        }
+        serverView = ServerView(cx, cz, sent.toLongArray(), player.loadedChunks.size)
+        if (++probeTicks % 100 != 0) return
+        log.info("Camera server side: player at {} {} (square centre {} {}), {} chunks sent, {} queued, {} chunks loaded in the world; " +
+            "ticks {}, in entity list {}", fmt(player.posX), fmt(player.posZ), cx, cz, sent.size, player.loadedChunks.size,
+            world.theChunkProviderServer.loadedChunkCount, player.ticksExisted, world.loadedEntityList.contains(player))
+    }
+
+    private fun chunkKey(x: Int, z: Int) = (x.toLong() shl 32) or (z.toLong() and 0xffffffffL)
+
+    /**
+     * Loads the chunk square around a teleport destination before the player gets there. Besides having the chunks
+     * ready to send, this takes them off the unload queue: every pause of the single-player game saves the worlds, and
+     * `WorldServer.saveAllChunks` queues every loaded chunk no player watches for unloading, among them chunks around
+     * the next camera (the server ticks a larger area than it sends). Unloading the chunk the player was just moved
+     * into unloads the player entity with it, which then never ticks again and never receives another chunk.
+     */
+    private fun preloadSquare(server: MinecraftServer, x: Double, z: Double) {
+        val player = server.configurationManager?.func_152612_a(playerName) ?: return
+        val provider = (player.worldObj as WorldServer).theChunkProviderServer
+        val cx = x.toInt() shr 4
+        val cz = z.toInt() shr 4
+        val range = spec.viewDistance
+        for (i in cx - range..cx + range) for (j in cz - range..cz + range) provider.loadChunk(i, j)
+    }
+
+    /**
+     * The integrated server sends the chunks within [Spec.viewDistance] like the dedicated scene server did: its player
+     * list keeps the client's render distance (so `IntegratedServer.tick` does not reset it), while every world's chunk
+     * radius and entity tracking range follow the view distance.
+     */
+    @SubscribeEvent
+    fun onWorldLoad(event: WorldEvent.Load) {
+        val world = event.world as? WorldServer ?: return
+        if (jobIndex < 0 || phase == Phase.FINISHED) return
+        val players = world.func_73046_m().configurationManager ?: return
+        playersViewDistance.setInt(players, spec.renderDistance)
+        world.playerManager.func_152622_a(spec.viewDistance)
+        entityViewDistance.setInt(world.entityTracker, PlayerManager.getFurthestViewableBlock(spec.viewDistance))
+    }
+
+    // ---- client side ----
 
     @SubscribeEvent
     fun onClientTick(event: TickEvent.ClientTickEvent) {
@@ -293,37 +477,48 @@ object CameraCapture {
             pin(mc)
             phaseTicks++
             step(mc)
-            if (phase > Phase.SETUP) ensureSize(mc, rebind = false)
+            if (inWorld) ensureSize(mc, rebind = false)
         } catch (t: Throwable) {
             log.fatal("Camera capture failed", t)
-            finish(mc, "${t.javaClass.simpleName}: ${t.message}")
+            if (jobIndex >= 0 && inWorld || phase == Phase.JOINING) jobFailed(mc, "${t.javaClass.simpleName}: ${t.message}")
+            else finishSession(mc, "${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
     private fun step(mc: Minecraft) {
+        if (inWorld || phase == Phase.JOINING) {
+            serverError?.let { throw IllegalStateException("integrated server: $it") }
+            if (phase != Phase.JOINING && (mc.theWorld == null || mc.currentScreen is GuiDisconnected)) {
+                throw IllegalStateException("left the world (screen ${mc.currentScreen?.javaClass?.name})")
+            }
+        }
         when (phase) {
+            Phase.MENU -> {
+                if (mc.currentScreen != null && mc.theWorld == null && ++menuTicks >= MENU_TICKS) {
+                    bootSeconds = (System.currentTimeMillis() - ManagementFactory.getRuntimeMXBean().startTime) / 1000.0
+                    check(Loader.isModLoaded("bmh")) { "the harness mod bmh is not loaded (gtnh-client cameras installs it)" }
+                    startJob(mc, 0)
+                }
+            }
             Phase.JOINING -> {
                 val screen = mc.currentScreen
-                if (screen is GuiDisconnected) throw IllegalStateException("disconnected from the server")
-                if (mc.theWorld != null && mc.thePlayer != null && screen !is GuiDownloadTerrain) {
+                if (screen is GuiDisconnected) throw IllegalStateException("disconnected from the integrated server")
+                if (mc.theWorld != null && mc.thePlayer != null && screen !is GuiDownloadTerrain && setupDone) {
                     if (++joinedTicks >= JOIN_SETTLE_TICKS) {
                         playerName = mc.thePlayer.commandSenderName
+                        jobTimings.addProperty("join", seconds(phaseStarted))
+                        val name = playerName
+                        onServer { command(it, "gamemode 1 $name") }
                         enter(Phase.SETUP)
                     }
                 } else {
                     joinedTicks = 0
                 }
-                if (seconds(started) > spec.joinTimeoutSeconds) {
-                    throw IllegalStateException("not in the world after ${spec.joinTimeoutSeconds} s (screen ${screen?.javaClass?.name})")
+                if (seconds(phaseStarted) > spec.worldTimeoutSeconds) {
+                    throw IllegalStateException("not in the world after ${spec.worldTimeoutSeconds} s (screen ${screen?.javaClass?.name})")
                 }
             }
             Phase.SETUP -> {
-                if (phaseTicks == 1) {
-                    rconCommand("gamemode 1 $playerName")
-                    rconCommand("time set 6000")
-                    rconCommand("weather clear 1000000")
-                    rconCommand("gamerule doDaylightCycle false")
-                }
                 val player = mc.thePlayer
                 if (player.capabilities.allowFlying) {
                     player.capabilities.isFlying = true
@@ -338,50 +533,84 @@ object CameraCapture {
                 val p = mc.thePlayer
                 if (abs(p.posX - c.x) < 1.0 && abs(p.posY - c.y) < 1.0 && abs(p.posZ - c.z) < 1.0) {
                     pinned = c
-                    enter(Phase.SETTLE)
+                    enter(Phase.LOAD)
                 } else if (seconds(phaseStarted) > TELEPORT_TIMEOUT_SECONDS) {
                     cameraFailed(mc, "teleport not confirmed by the server (reply: ${teleportReply.trim()})")
                 }
             }
-            Phase.SETTLE -> {
+            Phase.LOAD -> {
                 lastChunks = chunkStatus(mc)
-                lastTerrain = terrainComplete(mc)
-                val ready = lastChunks[1] == 0 && lastTerrain != false && phaseTicks >= FOV_SETTLE_TICKS
-                if (!ready) {
-                    readySince = -1
-                } else if (readySince < 0) {
-                    readySince = phaseTicks
-                }
-                if (readySince >= 0 && phaseTicks - readySince >= spec.settleTicks) {
-                    settled = true
-                    settleSeconds = seconds(cameraStarted)
+                loadedTicks = if (chunksReady) loadedTicks + 1 else 0
+                if (loadedTicks >= spec.loadTicks) {
+                    loadSeconds = seconds(cameraStarted)
+                    freeze(mc)
                     enter(Phase.STABILIZE)
                 } else if (seconds(cameraStarted) > spec.cameraTimeoutSeconds) {
-                    log.warn("Camera {}: not settled after {} s (chunks {}, terrain complete {})", camera.name,
-                        spec.cameraTimeoutSeconds, lastChunks.contentToString(), lastTerrain)
-                    settleSeconds = seconds(cameraStarted)
-                    enter(Phase.STABILIZE)
+                    // a capture without its terrain is no reference: fail the camera (and so the job) instead
+                    val view = if (lastChunks[3] < 0) "the server's chunk square never moved to the camera"
+                    else "${lastChunks[3]} of the view square's chunks"
+                    cameraFailed(mc, "chunks still missing after ${spec.cameraTimeoutSeconds} s: ${lastChunks[1]} of the " +
+                        "${lastChunks[0]} scene box chunks in range, $view")
                 }
             }
             Phase.STABILIZE -> {
-                lastTerrain = terrainComplete(mc)
-                if (phaseTicks % spec.stableIntervalTicks == 0) snapshotRequested = true
-                if (stableCount >= spec.stableFrames - 1 && lastTerrain != false) {
-                    enter(Phase.CAPTURE)
-                    captureRequested = true
-                } else if (seconds(phaseStarted) > STABILIZE_TIMEOUT_SECONDS) {
-                    log.warn("Camera {}: frames still changing after {} s ({})", camera.name, STABILIZE_TIMEOUT_SECONDS, changes)
-                    enter(Phase.CAPTURE)
+                // frames are compared in onRenderWorldLast; this only bounds the wait
+                if (!captureRequested && seconds(phaseStarted) > spec.stableTimeoutSeconds) {
+                    log.warn("Camera {}: frames still changing after {} s (terrain complete {}, {})", camera.name,
+                        spec.stableTimeoutSeconds, lastTerrain, changes.takeLast(8))
+                    stableTimedOut = true
                     captureRequested = true
                 }
+                if (captureRequested) enter(Phase.CAPTURE)
             }
             Phase.CAPTURE -> {
                 // the capture itself happens in the next RenderWorldLastEvent of the right size
                 if (!captureRequested) nextCamera(mc)
                 else if (seconds(phaseStarted) > TELEPORT_TIMEOUT_SECONDS) cameraFailed(mc, "no frame of the camera size was rendered")
             }
+            Phase.LEAVE -> leaveWorld(mc)
             Phase.FINISHED -> {}
         }
+    }
+
+    private fun startJob(mc: Minecraft, next: Int) {
+        jobIndex = next
+        val j = job
+        jobStarted = System.nanoTime()
+        jobTimings = JsonObject()
+        jobError = null
+        joinedTicks = 0
+        index = 0
+        results = JsonArray()
+        failures = 0
+        setupDone = false
+        serverError = null
+        serverTasks.clear()
+        j.outDir.mkdirs()
+        log.info("Camera job {}/{}: scene {} (save {}), {} cameras -> {}", next + 1, spec.jobs.size, j.scene, j.save,
+            j.cameras.size, j.outDir)
+        val levelDat = File(mc.mcDataDir, "saves/${j.save}/level.dat")
+        if (!levelDat.isFile) {
+            jobError = "$levelDat does not exist"
+            writeJobReport(mc)
+            enter(Phase.LEAVE)
+            return
+        }
+        // runs at the integrated server's first tick, before the player has joined
+        onServer { server ->
+            bmh(server, "random-ticks " + if (j.freezeRandomTicks) "off" else "on")
+            for (cell in j.remove) bmh(server, "set 0 ${cell[0]} ${cell[1]} ${cell[2]} minecraft:air 0")
+            command(server, "time set 6000")
+            command(server, "weather clear 1000000")
+            command(server, "gamerule doDaylightCycle false")
+            command(server, "gamerule doMobSpawning false")
+            setupDone = true
+        }
+        enter(Phase.JOINING)
+        val opening = System.nanoTime()
+        mc.launchIntegratedServer(j.save, j.scene, null) // blocks until the integrated server runs
+        jobTimings.addProperty("open", seconds(opening))
+        phaseStarted = System.nanoTime()
     }
 
     private fun startCamera(mc: Minecraft) {
@@ -389,23 +618,49 @@ object CameraCapture {
         pinned = null
         mc.gameSettings.fovSetting = c.fov
         cameraStarted = System.nanoTime()
-        readySince = -1
-        settled = false
-        settleSeconds = Double.NaN
-        snapshotRequested = false
-        captureRequested = false
+        loadedTicks = 0
+        loadSeconds = Double.NaN
+        lastTerrain = null
+        frozen = false
+        frozenFrames = 0
         lastSnapshot = null
+        lastSnapshotAt = 0L
         stableCount = 0
         changes = mutableListOf()
-        teleportReply = rconCommand("tp $playerName ${fmt(c.x)} ${fmt(c.y - EYE_HEIGHT)} ${fmt(c.z)}")
-        log.info("Camera {} ({}/{}): eye {} {} {}, yaw {}, pitch {}, fov {}", c.name, index + 1, spec.cameras.size, c.x, c.y, c.z,
+        frames = 0
+        captureRequested = false
+        stableTimedOut = false
+        teleportReply = ""
+        serverView = null
+        probing = true
+        val name = playerName
+        onServer {
+            preloadSquare(it, c.x, c.z)
+            teleportReply = command(it, "tp $name ${fmt(c.x)} ${fmt(c.y - EYE_HEIGHT)} ${fmt(c.z)}")
+        }
+        log.info("Camera {} ({}/{}): eye {} {} {}, yaw {}, pitch {}, fov {}", c.name, index + 1, job.cameras.size, c.x, c.y, c.z,
             c.yaw, c.pitch, c.fov)
         enter(Phase.TELEPORT)
     }
 
+    /** Pauses the game behind [FreezeScreen]: the world, its entities, tile entities, particles and textures stop. */
+    private fun freeze(mc: Minecraft) {
+        frozen = true
+        probing = false
+        frozenFrames = 0
+        mc.displayGuiScreen(FreezeScreen)
+    }
+
+    private fun unfreeze(mc: Minecraft) {
+        if (!frozen) return
+        frozen = false
+        if (mc.currentScreen === FreezeScreen) mc.displayGuiScreen(null)
+    }
+
     private fun nextCamera(mc: Minecraft) {
+        unfreeze(mc)
         index++
-        if (index < spec.cameras.size) startCamera(mc) else finish(mc, null)
+        if (index < job.cameras.size) startCamera(mc) else finishJob(mc)
     }
 
     private fun cameraFailed(mc: Minecraft, reason: String) {
@@ -418,35 +673,97 @@ object CameraCapture {
             addProperty("seconds", seconds(cameraStarted))
         })
         captureRequested = false
-        snapshotRequested = false
         nextCamera(mc)
     }
 
-    private fun finish(mc: Minecraft, error: String?) {
-        if (phase == Phase.FINISHED) return
-        phase = Phase.FINISHED
+    /** The job cannot go on (server error, disconnect, timeout): its remaining cameras fail, the next job starts. */
+    private fun jobFailed(mc: Minecraft, reason: String) {
+        if (phase == Phase.LEAVE || phase == Phase.FINISHED || jobIndex < 0) return
+        log.error("Camera job {} failed: {}", job.scene, reason)
+        jobError = reason
+        captureRequested = false
         pinned = null
+        unfreeze(mc)
+        finishJob(mc)
+    }
+
+    private fun finishJob(mc: Minecraft) {
+        pinned = null
+        jobTimings.addProperty("cameras", results.sumOf { it.asJsonObject.get("seconds").asDouble })
+        writeJobReport(mc)
+        enter(Phase.LEAVE)
+    }
+
+    private fun writeJobReport(mc: Minecraft) {
+        val j = job
+        val captured = results.count { it.asJsonObject.get("captured").asBoolean }
+        if (jobError != null || captured < j.cameras.size) failedJobs++
         val report = JsonObject().apply {
-            addProperty("scene", spec.scene)
-            addProperty("cameras", spec.cameras.size)
-            addProperty("captured", results.count { it.asJsonObject.get("captured").asBoolean })
-            addProperty("failed", spec.cameras.size - results.count { it.asJsonObject.get("captured").asBoolean })
-            error?.let { addProperty("error", it) }
-            addProperty("seconds", seconds(started))
+            addProperty("scene", j.scene)
+            addProperty("capture_version", spec.captureVersion)
+            addProperty("cameras", j.cameras.size)
+            addProperty("captured", captured)
+            addProperty("failed", j.cameras.size - captured)
+            jobError?.let { addProperty("error", it) }
+            addProperty("seconds", seconds(jobStarted))
+            add("timings", jobTimings)
             add("settings", settingsJson(mc))
             add("results", results)
         }
-        File(outDir, "cameras-report.json").writeText(PackWriter.PRETTY_GSON.toJson(report))
-        try {
-            rcon?.close()
-        } catch (_: Exception) {
+        j.outDir.mkdirs()
+        File(j.outDir, "cameras-report.json").writeText(PackWriter.PRETTY_GSON.toJson(report))
+        sessionJobs.add(JsonObject().apply {
+            addProperty("scene", j.scene)
+            addProperty("out", j.outDir.path)
+            addProperty("captured", captured)
+            addProperty("failed", j.cameras.size - captured)
+            jobError?.let { addProperty("error", it) }
+            addProperty("seconds", seconds(jobStarted))
+            add("timings", jobTimings)
+        })
+    }
+
+    /** Back to the main menu (the integrated server saves and stops), then the next job or the end of the session. */
+    private fun leaveWorld(mc: Minecraft) {
+        if (phaseTicks == 1) {
+            val leaving = System.nanoTime()
+            unfreeze(mc)
+            if (mc.theWorld != null) {
+                mc.theWorld.sendQuittingDisconnectingPacket()
+                mc.loadWorld(null)
+            }
+            mc.displayGuiScreen(GuiMainMenu())
+            val leave = seconds(leaving)
+            (sessionJobs.lastOrNull() as? JsonObject)?.getAsJsonObject("timings")?.addProperty("leave", leave)
+            log.info("Camera job {} done in {} s (leaving {} s)", job.scene, seconds(jobStarted), leave)
+            return
+        }
+        if (jobIndex + 1 < spec.jobs.size) startJob(mc, jobIndex + 1) else finishSession(mc, null)
+    }
+
+    private fun finishSession(mc: Minecraft, error: String?) {
+        if (phase == Phase.FINISHED) return
+        phase = Phase.FINISHED
+        pinned = null
+        spec.session?.let { file ->
+            val report = JsonObject().apply {
+                addProperty("capture_version", spec.captureVersion)
+                addProperty("jobs", spec.jobs.size)
+                addProperty("failedJobs", failedJobs + (spec.jobs.size - sessionJobs.size()))
+                error?.let { addProperty("error", it) }
+                addProperty("bootSeconds", bootSeconds)
+                addProperty("seconds", seconds(started))
+                add("results", sessionJobs)
+            }
+            file.parentFile?.mkdirs()
+            file.writeText(PackWriter.PRETTY_GSON.toJson(report))
         }
         if (System.getProperty("bluemap.gtnh.exporter.stay") == "true") return
-        if (error == null && failures == 0) {
+        if (error == null && failedJobs == 0) {
             log.info("Camera capture finished, shutting down the client")
             mc.shutdown()
         } else {
-            log.error("Camera capture finished with errors ({}), exiting with 1", error ?: "$failures cameras failed")
+            log.error("Camera capture finished with errors ({}), exiting with 1", error ?: "$failedJobs jobs failed")
             FMLCommonHandler.instance().exitJava(1, false)
         }
     }
@@ -475,7 +792,7 @@ object CameraCapture {
 
     /** The game framebuffer at the camera's size (the window itself stays minimized and is never resized). */
     private fun ensureSize(mc: Minecraft, rebind: Boolean) {
-        val c = pinned ?: spec.cameras.getOrNull(index) ?: return
+        val c = pinned ?: job.cameras.getOrNull(index) ?: return
         val fb = mc.framebuffer
         if (mc.displayWidth != c.width || mc.displayHeight != c.height || fb.framebufferWidth != c.width ||
             fb.framebufferHeight != c.height
@@ -488,19 +805,30 @@ object CameraCapture {
 
     @SubscribeEvent
     fun onRenderTick(event: TickEvent.RenderTickEvent) {
-        if (event.phase != TickEvent.Phase.START || phase <= Phase.JOINING || phase == Phase.FINISHED) return
+        if (event.phase != TickEvent.Phase.START || !inWorld) return
         val mc = Minecraft.getMinecraft()
         if (mc.theWorld == null || mc.thePlayer == null) return
         try {
+            frames++
             pin(mc)
             ensureSize(mc, rebind = true)
-            if (mc.currentScreen != null) mc.displayGuiScreen(null)
+            val screen = if (frozen) FreezeScreen else null
+            if (mc.currentScreen !== screen) mc.displayGuiScreen(screen)
             mc.gameSettings.hideGUI = true
+            mc.effectRenderer.clearEffects(mc.theWorld)
+            // the FOV is the camera's at once (the FOV event already cancels the flying boost the modifier eases to)
+            fovModifierHand.setFloat(mc.entityRenderer, 1.0f)
+            fovModifierHandPrev.setFloat(mc.entityRenderer, 1.0f)
+            if (frozen && mc.isGamePaused) {
+                frozenFrames++
+                (timer.get(mc) as Timer).renderPartialTicks = 0f
+                mc.theWorld.func_82738_a(FROZEN_WORLD_TIME)
+            }
             freezeAnimations(mc)
             whiteLightmap(mc)
         } catch (t: Throwable) {
             log.fatal("Camera capture failed", t)
-            finish(mc, "${t.javaClass.simpleName}: ${t.message}")
+            jobFailed(mc, "${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
@@ -547,12 +875,12 @@ object CameraCapture {
     @SubscribeEvent
     fun onRenderHand(event: RenderHandEvent) {
         // no hand, and no depth clear before it: the depth buffer keeps the world for the capture
-        if (phase > Phase.JOINING) event.isCanceled = true
+        if (inWorld) event.isCanceled = true
     }
 
     @SubscribeEvent
     fun onFog(event: EntityViewRenderEvent.RenderFogEvent) {
-        if (phase <= Phase.JOINING) return
+        if (!inWorld) return
         GL11.glFogf(GL11.GL_FOG_START, FOG_DISTANCE)
         GL11.glFogf(GL11.GL_FOG_END, FOG_DISTANCE * 2)
     }
@@ -560,7 +888,7 @@ object CameraCapture {
     @SubscribeEvent
     fun onFov(event: FOVUpdateEvent) {
         // no FOV boost from flying or speed: the projection uses exactly gameSettings.fovSetting
-        if (phase > Phase.JOINING) event.newfov = 1.0f
+        if (inWorld) event.newfov = 1.0f
     }
 
     /** Pixel buffer RGBA of the bound framebuffer, rows bottom to top as GL returns them. */
@@ -574,32 +902,48 @@ object CameraCapture {
 
     @SubscribeEvent(priority = EventPriority.HIGHEST)
     fun onRenderWorldLast(event: RenderWorldLastEvent) {
-        if (!snapshotRequested && !captureRequested) return
+        if (phase != Phase.STABILIZE && phase != Phase.CAPTURE) return
         val mc = Minecraft.getMinecraft()
         val c = pinned ?: return
         try {
+            // a frame of the frozen game: the pause takes effect one frame after the screen opened
+            if (!mc.isGamePaused || frozenFrames < 2) return
             val viewport = BufferUtils.createIntBuffer(16)
             GL11.glGetInteger(GL11.GL_VIEWPORT, viewport)
             if (mc.displayWidth != c.width || mc.displayHeight != c.height || viewport.get(2) != c.width || viewport.get(3) != c.height) return
+            if (captureRequested) {
+                val pixels = readColor(c.width, c.height)
+                capture(mc, c, event.partialTicks, ByteArray(pixels.remaining()).also { pixels.get(it) }, viewport)
+                captureRequested = false
+                return
+            }
+            lastTerrain = terrainComplete(mc)
+            if (lastTerrain == false) {
+                stableCount = 0
+                lastSnapshot = null
+                return
+            }
+            val now = System.nanoTime()
+            if (lastSnapshot != null && (now - lastSnapshotAt) / 1e9 < spec.stableIntervalSeconds) return
             val pixels = readColor(c.width, c.height)
             val bytes = ByteArray(pixels.remaining()).also { pixels.get(it) }
-            if (captureRequested) {
+            val previous = lastSnapshot
+            if (previous != null) {
+                val changed = changedRatio(previous, bytes)
+                changes.add(changed)
+                stableCount = if (changed <= spec.stableTolerance) stableCount + 1 else 0
+            }
+            lastSnapshot = bytes
+            lastSnapshotAt = now
+            if (stableCount >= spec.stableFrames - 1) {
+                // this frame agrees with the previous ones: it is the capture
                 capture(mc, c, event.partialTicks, bytes, viewport)
                 captureRequested = false
-                snapshotRequested = false
-            } else {
-                val previous = lastSnapshot
-                if (previous != null) {
-                    val changed = changedRatio(previous, bytes)
-                    changes.add(changed)
-                    stableCount = if (changed <= spec.stableTolerance) stableCount + 1 else 0
-                }
-                lastSnapshot = bytes
-                snapshotRequested = false
+                enter(Phase.CAPTURE)
             }
         } catch (t: Throwable) {
             log.fatal("Camera capture failed", t)
-            finish(mc, "${t.javaClass.simpleName}: ${t.message}")
+            jobFailed(mc, "${t.javaClass.simpleName}: ${t.message}")
         }
     }
 
@@ -629,6 +973,7 @@ object CameraCapture {
     private fun capture(mc: Minecraft, c: Camera, partialTicks: Float, rgba: ByteArray, viewport: java.nio.IntBuffer) {
         val w = c.width
         val h = c.height
+        val outDir = job.outDir
         val depth = BufferUtils.createFloatBuffer(w * h)
         GL11.glPixelStorei(GL11.GL_PACK_ALIGNMENT, 1)
         GL11.glReadPixels(0, 0, w, h, GL11.GL_DEPTH_COMPONENT, GL11.GL_FLOAT, depth)
@@ -659,19 +1004,21 @@ object CameraCapture {
         File(outDir, "${c.name}.depth.bin").writeBytes(depthOut.array())
 
         val gs = mc.gameSettings
+        val stable = !stableTimedOut && stableCount >= spec.stableFrames - 1
+        val cameraSeconds = seconds(cameraStarted)
         val json = JsonObject().apply {
             addProperty("name", c.name)
-            addProperty("scene", spec.scene)
+            addProperty("scene", job.scene)
             addProperty("width", w)
             addProperty("height", h)
-            add("eye", JsonArray().also { a -> doubleArrayOf(c.x, c.y, c.z).forEach { a.add(com.google.gson.JsonPrimitive(it)) } })
+            add("eye", JsonArray().also { a -> doubleArrayOf(c.x, c.y, c.z).forEach { a.add(JsonPrimitive(it)) } })
             addProperty("yaw", c.yaw)
             addProperty("pitch", c.pitch)
             addProperty("fov", c.fov)
-            add("camera", JsonArray().also { a -> cameraPos.forEach { a.add(com.google.gson.JsonPrimitive(it)) } })
+            add("camera", JsonArray().also { a -> cameraPos.forEach { a.add(JsonPrimitive(it)) } })
             add("renderPos", JsonArray().also { a ->
                 doubleArrayOf(RenderManager.renderPosX, RenderManager.renderPosY, RenderManager.renderPosZ)
-                    .forEach { a.add(com.google.gson.JsonPrimitive(it)) }
+                    .forEach { a.add(JsonPrimitive(it)) }
             })
             addProperty("partialTicks", partialTicks)
             addProperty("matrixOrder", "column-major (OpenGL); world -> eye = modelview * translate(-camera)")
@@ -684,7 +1031,7 @@ object CameraCapture {
             addProperty("fovApplied", gs.fovSetting * fovModifierHand.getFloat(mc.entityRenderer))
             addProperty("near", 0.05)
             addProperty("far", gs.renderDistanceChunks * 16.0 * 2.0)
-            add("viewport", JsonArray().also { a -> (0 until 4).forEach { a.add(com.google.gson.JsonPrimitive(viewport.get(it))) } })
+            add("viewport", JsonArray().also { a -> (0 until 4).forEach { a.add(JsonPrimitive(viewport.get(it))) } })
             addProperty("framebufferBinding", framebuffer)
             addProperty("gameFramebuffer", mc.framebuffer.framebufferObject)
             addProperty("image", "${c.name}.png")
@@ -693,46 +1040,70 @@ object CameraCapture {
                 addProperty("format", "float32 little endian, rows top to bottom, OpenGL window depth 0..1 (1 = nothing drawn)")
             })
             add("settle", JsonObject().apply {
-                addProperty("settled", settled)
-                addProperty("seconds", settleSeconds)
+                addProperty("settled", chunksReady && lastTerrain != false)
+                addProperty("seconds", loadSeconds)
                 addProperty("chunksRequired", lastChunks[0])
                 addProperty("chunksMissing", lastChunks[1])
                 addProperty("chunksOutOfRange", lastChunks[2])
+                addProperty("viewChunksMissing", lastChunks[3])
                 lastTerrain?.let { addProperty("terrainComplete", it) }
                 addProperty("terrainRenderer", terrainSource)
             })
             add("stability", JsonObject().apply {
-                addProperty("stable", stableCount >= spec.stableFrames - 1)
+                addProperty("stable", stable)
                 addProperty("tolerance", spec.stableTolerance)
-                add("changedRatios", JsonArray().also { a -> changes.forEach { a.add(com.google.gson.JsonPrimitive(it)) } })
+                addProperty("intervalSeconds", spec.stableIntervalSeconds)
+                add("changedRatios", JsonArray().also { a -> changes.forEach { a.add(JsonPrimitive(it)) } })
             })
+            addProperty("frozen", mc.isGamePaused)
+            addProperty("frames", frames)
+            addProperty("fps", frames / cameraSeconds)
             addProperty("teleport", teleportReply.trim())
-            addProperty("seconds", seconds(cameraStarted))
+            addProperty("seconds", cameraSeconds)
         }
         File(outDir, "${c.name}.json").writeText(PackWriter.PRETTY_GSON.toJson(json))
         results.add(JsonObject().apply {
             addProperty("name", c.name)
             addProperty("captured", true)
-            addProperty("settled", settled)
-            addProperty("stable", stableCount >= spec.stableFrames - 1)
-            addProperty("seconds", seconds(cameraStarted))
+            addProperty("settled", chunksReady && lastTerrain != false)
+            addProperty("stable", stable)
+            addProperty("seconds", cameraSeconds)
+            addProperty("loadSeconds", loadSeconds)
+            addProperty("fps", frames / cameraSeconds)
         })
-        log.info("Camera {} captured ({} s)", c.name, seconds(cameraStarted))
+        log.info("Camera {} captured ({} s, load {} s, {} frames)", c.name, cameraSeconds, loadSeconds, frames)
     }
 
-    private fun floatsJson(values: FloatArray) = JsonArray().also { a -> values.forEach { a.add(com.google.gson.JsonPrimitive(it)) } }
+    private fun floatsJson(values: FloatArray) = JsonArray().also { a -> values.forEach { a.add(JsonPrimitive(it)) } }
 
-    /** [required, missing, out of range]: chunks overlapping the scene box within the server's and the client's view distance. */
+    /** Every chunk of the scene box in range and every chunk the server has sent is on the client, none still queued. */
+    private val chunksReady: Boolean get() = lastChunks[1] == 0 && lastChunks[3] == 0
+
+    /**
+     * [required, missing, out of range, view missing]: chunks overlapping the scene box within the server's and the
+     * client's view distance, and the chunks the server has sent or still has queued for the player (the scene's
+     * surroundings are drawn too) that the client does not have yet; view missing is -1 while the server's square is
+     * not known or still the previous camera's.
+     */
     private fun chunkStatus(mc: Minecraft): IntArray {
-        val box = spec.box ?: return intArrayOf(0, 0, 0)
-        val c = camera
         val range = min(spec.viewDistance, mc.gameSettings.renderDistanceChunks)
-        val pcx = floor(c.x / 16).toInt()
-        val pcz = floor(c.z / 16).toInt()
+        val view = serverView ?: return intArrayOf(0, 0, 0, -1)
+        val pcx = view.centreX
+        val pcz = view.centreZ
+        // the square follows the player within 8 blocks: further off, it is still the previous camera's
+        val c = camera
+        if (max(abs(pcx - (c.x.toInt() shr 4)), abs(pcz - (c.z.toInt() shr 4))) > 1 || view.sent.isEmpty()) {
+            return intArrayOf(0, 0, 0, -1)
+        }
+        val provider = mc.theWorld.getChunkProvider()
+        var viewMissing = view.queued
+        for (key in view.sent) {
+            if (provider.provideChunk((key shr 32).toInt(), key.toInt()) is EmptyChunk) viewMissing++
+        }
+        val box = job.box ?: return intArrayOf(0, 0, 0, viewMissing)
         var required = 0
         var missing = 0
         var outOfRange = 0
-        val provider = mc.theWorld.getChunkProvider()
         for (cx in (box[0] shr 4)..(box[3] shr 4)) {
             for (cz in (box[2] shr 4)..(box[5] shr 4)) {
                 if (max(abs(cx - pcx), abs(cz - pcz)) > range) {
@@ -743,7 +1114,7 @@ object CameraCapture {
                 if (provider.provideChunk(cx, cz) is EmptyChunk) missing++
             }
         }
-        return intArrayOf(required, missing, outOfRange)
+        return intArrayOf(required, missing, outOfRange, viewMissing)
     }
 
     /** Celeritas `isTerrainRenderComplete()`, else vanilla's pending chunk renderer list; null if neither is known. */

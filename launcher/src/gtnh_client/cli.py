@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import shutil
@@ -10,10 +11,11 @@ import signal
 import subprocess
 import sys
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from gtnh_client import cameras, coverage, packs, states
+from gtnh_client import cameras, coverage, lock, packs, states, workers
 from gtnh_client.proxy import DelayProxy
 from gtnh_client.download import DownloadError
 from gtnh_client.instance import Layout, PrepareError, ensure_downloads, prepare
@@ -21,14 +23,17 @@ from gtnh_client.launch import (
     JAVA_TOOL,
     LWJGL3IFY_WINDOW,
     MUTE_OPTION,
+    ClientProcess,
     build_command,
     configure_lwjgl3ify,
+    group_rss_kib,
     install_mods,
     install_resource_packs,
     keep_awake,
     mute_sound,
     restore_resource_packs,
     run_process,
+    run_processes,
 )
 from gtnh_client.profile import ProfileError
 
@@ -81,24 +86,21 @@ def make_layout(client_dir: Path | None, pack: packs.Pack) -> Layout:
     return Layout((client_dir or default_client_dir(pack)).resolve(), (workspace() / "downloads" / "mc-cache").resolve())
 
 
-def run_client(
+@contextlib.contextmanager
+def client_session(
     layout: Layout,
     *,
     zip_path: Path,
     mods: list[Path],
-    jvm_args: list[str],
-    xmx: str,
-    timeout: float,
-    username: str,
-    log: Path | None,
     extra_mods: list[Path] = (),
     resource_packs: list[Path] = (),
-    game_args: list[str] = (),
     disable_exporter: bool = False,
-) -> int:
-    """`extra_mods` and `resource_packs` are installed for this run only and removed afterwards (options.txt
-    `resourcePacks` restored), so later default runs are unaffected. `disable_exporter` parks the exporter mod in
-    `.minecraft/mods-disabled/` for the session (it would export and quit) and puts it back afterwards."""
+):
+    """Gets an instance ready for one run and yields its profile: prepares it if the client directory is missing,
+    fetches missing downloads, installs `mods` and, for this run only, `extra_mods` and `resource_packs` (removed
+    afterwards, options.txt `resourcePacks` restored, so later default runs are unaffected), and writes the window and
+    mute settings. `disable_exporter` parks the exporter mod in `.minecraft/mods-disabled/` for the session (it would
+    export and quit) and puts it back afterwards."""
     if not layout.client_dir.exists():
         prepare(layout, zip_path)
     profile = layout.load_profile()
@@ -118,18 +120,11 @@ def run_client(
             parked.append((target, jar))
             print(f"[run] parked {jar.name} in {disabled} for this session")
     installed_packs, previous_packs = install_resource_packs(layout.minecraft_dir, list(resource_packs))
-    # SIGTERM/SIGHUP (e.g. the caller's process group is terminated) must also kill the client and run the cleanup
-    # below; run_process kills the Java process tree on KeyboardInterrupt
-    previous_handlers = {sig: signal.signal(sig, _interrupt) for sig in (signal.SIGTERM, signal.SIGHUP)}
     try:
         cfg = configure_lwjgl3ify(layout.minecraft_dir)
         print(f"[run] {cfg}: window " + ", ".join(f"{k}={str(v).lower()}" for k, v in LWJGL3IFY_WINDOW.items()))
         print(f"[run] {mute_sound(layout.minecraft_dir)}: {MUTE_OPTION[0]}:{MUTE_OPTION[1]} (muted)")
-        cmd = build_command(layout, profile, xmx=xmx, jvm_args=jvm_args, username=username, game_args=list(game_args))
-        log = log or layout.client_dir / "logs-launcher" / f"client-{datetime.now():%Y%m%d-%H%M%S}.log"
-        print(f"[run] log: {log}", flush=True)
-        with keep_awake(timeout):
-            return run_process(cmd, cwd=layout.minecraft_dir, log_file=log, timeout=timeout)
+        yield profile
     finally:
         restore_resource_packs(layout.minecraft_dir, installed_packs, previous_packs)
         for jar in temporary_mods:
@@ -139,8 +134,37 @@ def run_client(
             parked_jar.replace(original)
             print(f"[run] restored {original}")
         recover_parked_mods(layout.minecraft_dir)  # removes the then empty mods-disabled/
-        for sig, handler in previous_handlers.items():
-            signal.signal(sig, handler)
+
+
+def default_log(layout: Layout, kind: str = "client") -> Path:
+    return layout.instance_dir / "logs-launcher" / f"{kind}-{datetime.now():%Y%m%d-%H%M%S}.log"
+
+
+def run_client(
+    layout: Layout,
+    *,
+    zip_path: Path,
+    mods: list[Path],
+    jvm_args: list[str],
+    xmx: str,
+    timeout: float,
+    username: str,
+    log: Path | None,
+    extra_mods: list[Path] = (),
+    resource_packs: list[Path] = (),
+    game_args: list[str] = (),
+    disable_exporter: bool = False,
+) -> int:
+    """One client run with [client_session]; returns the java exit code (see [run_process])."""
+    with terminate_as_interrupt(), client_session(
+        layout, zip_path=zip_path, mods=mods, extra_mods=extra_mods, resource_packs=resource_packs,
+        disable_exporter=disable_exporter,
+    ) as profile:
+        cmd = build_command(layout, profile, xmx=xmx, jvm_args=jvm_args, username=username, game_args=list(game_args))
+        log = log or default_log(layout)
+        print(f"[run] log: {log}", flush=True)
+        with keep_awake(timeout):
+            return run_process(cmd, cwd=layout.minecraft_dir, log_file=log, timeout=timeout)
 
 
 class Terminated(KeyboardInterrupt):
@@ -153,6 +177,18 @@ class Terminated(KeyboardInterrupt):
 
 def _interrupt(signum: int, frame) -> None:
     raise Terminated(signum)
+
+
+@contextlib.contextmanager
+def terminate_as_interrupt():
+    """SIGTERM/SIGHUP (e.g. the caller's process group is terminated) raise [Terminated] in the main thread, so the
+    client process trees are killed and the run's cleanup happens."""
+    previous = {sig: signal.signal(sig, _interrupt) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    try:
+        yield
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 def recover_parked_mods(minecraft_dir: Path) -> None:
@@ -299,122 +335,184 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
+DEFAULT_PARALLEL = 1  # N > 1 works but is flaky (see the README); measured: N=4 116 s vs N=1 138 s for 7 scenes
+
+
+@dataclass
+class WorkerRun:
+    """One client of a parallel run: worker `index`'s instance and its JVM arguments; filled in by [run_workers]."""
+
+    index: int
+    layout: Layout
+    jvm_args: list[str]
+    jobs: list = field(default_factory=list)
+    log: Path | None = None
+    code: int | None = None
+    rss_peak_kib: int = 0
+
+
+def run_workers(
+    runs: list[WorkerRun],
+    *,
+    zip_path: Path,
+    mods: list[Path],
+    extra_mods: list[Path],
+    resource_packs: list[Path],
+    xmx: str,
+    timeout: float,
+    username: str,
+    kind: str,
+    settings=None,
+) -> list[int]:
+    """Runs one client per worker at the same time ([client_session] for each, `settings(minecraft_dir)` around each
+    run if given) and waits for all of them. Console lines are prefixed with `[w<i>]` when there is more than one
+    worker; each worker's full log is `<worker>/logs-launcher/<kind>-<timestamp>.log`. Records each exit code and the
+    peak resident memory of each client's process group."""
+    with terminate_as_interrupt(), contextlib.ExitStack() as stack:
+        commands = []
+        for run in runs:
+            profile = stack.enter_context(client_session(
+                run.layout, zip_path=zip_path, mods=mods, extra_mods=extra_mods, resource_packs=resource_packs))
+            if settings is not None:
+                stack.enter_context(settings(run.layout.minecraft_dir))
+            commands.append(build_command(run.layout, profile, xmx=xmx, jvm_args=run.jvm_args, username=username))
+            run.log = default_log(run.layout, kind)
+            print(f"[run] worker {run.index} log: {run.log}", flush=True)
+        stack.enter_context(keep_awake(timeout))
+        procs: list[ClientProcess] = []
+        try:
+            for run, cmd in zip(runs, commands):
+                prefix = f"[w{run.index}] " if len(runs) > 1 else ""
+                procs.append(ClientProcess(cmd, cwd=run.layout.minecraft_dir, log_file=run.log, prefix=prefix))
+
+            def sample() -> None:
+                rss = group_rss_kib()
+                for run, proc in zip(runs, procs):
+                    run.rss_peak_kib = max(run.rss_peak_kib, rss.get(proc.pgid, 0))
+
+            codes = run_processes(procs, timeout=timeout, sample=sample)
+        except BaseException:
+            for proc in procs:
+                if proc.code is None:
+                    proc.kill()
+                    proc.finish(1)
+            raise
+    for run, code in zip(runs, codes):
+        run.code = code
+    return codes
+
+
+def default_bmh_jar(pack: packs.Pack) -> Path:
+    """The harness mod the scene server runs: the newest `bmh-*.jar` in `WS/servers/gtnh-<V>/mods/`."""
+    mods = workspace() / "servers" / pack.server / "mods"
+    jars = [p for p in mods.glob("bmh-*.jar") if not p.stem.endswith(("-dev", "-sources"))]
+    if not jars:
+        raise CliError(f"no bmh-*.jar in {mods}; pass --bmh-jar (the harness build, harness/build/libs/bmh-<v>.jar)")
+    return max(jars, key=lambda p: p.stat().st_mtime)
+
+
+def _read_fresh(path: Path, started_wall: float) -> dict | None:
+    if not path.is_file() or path.stat().st_mtime < started_wall:
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
 def cmd_cameras(args: argparse.Namespace) -> int:
-    """Reference screenshots of a scene world: restore it on the server, join with the client in the exporter mod's
-    `cameras` mode, check the outputs, stop the server."""
+    """Reference screenshots of scene worlds (`--jobs`): split the jobs across `--parallel` worker instances, copy
+    each job's world into its worker's `saves/`, run the workers' clients in the exporter mod's `cameras` mode (one
+    session each, the saves opened one after another), check every job's outputs."""
     started_wall = time.time()
     t0 = time.monotonic()
-    ws = workspace()
-    scene_dir = args.gtnh_pack.dir(ws, "out/oracle") / args.variant / "worlds" / args.scene
-    cameras_file = (args.cameras or scene_dir / "cameras.json").resolve()
-    out = (args.out or scene_dir / "client").resolve()
-    data = cameras.read_cameras(cameras_file)
-    if data["scene"] != args.scene:
-        raise CliError(f"{cameras_file} is for scene {data['scene']}, not {args.scene}")
+    jobs = cameras.read_jobs(args.jobs.resolve())
     for path in [*args.resource_pack, *args.extra_mod]:
         if not path.exists():
             raise CliError(f"{path} does not exist")
     if args.mod_jar and not args.mod_jar.is_file():
         raise CliError(f"--mod-jar {args.mod_jar} does not exist")
-    server_dir = ws / "servers" / args.server_dir
-    password_file = server_dir / ".rcon-password"
-    if not password_file.is_file():
-        raise CliError(f"{password_file} does not exist (see the orchestrator README)")
-    orch_checkout = ws / "orchestrator"
-    if not (orch_checkout / "pyproject.toml").is_file():
-        raise CliError(f"orchestrator checkout not found at {orch_checkout}")
-    world = data.get("world", args.scene)
-    worlds = args.gtnh_pack.dir(ws, "worlds")
-    if not args.running_server and not (worlds / world).is_dir():
-        raise CliError(f"scene world {worlds / world} does not exist; build it with "
-                       f"`uv run orch --pack-version {args.gtnh_pack.version} scene {args.scene}`")  # fmt: skip
-
+    if args.bmh_jar and not args.bmh_jar.is_file():
+        raise CliError(f"--bmh-jar {args.bmh_jar} does not exist")
+    if args.parallel < 1:
+        raise CliError("--parallel must be at least 1")
+    bmh_jar = (args.bmh_jar or default_bmh_jar(args.gtnh_pack)).resolve()
     mod_jar = args.mod_jar.resolve() if args.mod_jar else build_exporter_mod()
-    layout = make_layout(args.client_dir, args.gtnh_pack)
-    if not layout.client_dir.exists():
-        prepare(layout, default_zip(args.gtnh_pack))
-    out.mkdir(parents=True, exist_ok=True)
-    cameras.clean_outputs(out, data)
-    spec = cameras.build_spec(
-        data, rcon_port=args.rcon_port, password_file=password_file, view_distance=cameras.server_view_distance(server_dir)
-    )
-    spec_file = cameras.write_spec(spec, out)
-    orch = cameras.Orchestrator(
-        orch_checkout, args.server_dir, args.port, args.rcon_port, level=cameras.LEVEL_PREFIX + args.scene,
-        level_type=data.get("levelType", "FLAT"), pack_version=args.gtnh_pack.version,
-    )
     t_build = time.monotonic()
-    t_server = t_client = t_build
-    started_server = False
-    froze_ticks = False
-    proxy = None
-    code = 1
+    base = make_layout(args.client_dir, args.gtnh_pack)
+    if not base.client_dir.exists():
+        prepare(base, default_zip(args.gtnh_pack))
+    runs: list[WorkerRun] = []
+    codes: list[int] = []
+    t_setup = t_run = time.monotonic()
     try:
-        if not args.running_server:
-            if orch.running():
-                raise CliError(f"a server is already running in {server_dir}; stop it (`uv run orch stop`) or pass --running-server")
-            orch.run("restore", world)
-            started_server = True  # stop and delete the level even if the start fails half-way
-            orch.run("start")
-        # No random ticks while the player is near the scene: the world stays as dumped (no grass spread, crop
-        # growth, leaf decay), and blocks whose random tick crashes on zoo metas (Binnie Botany soil) stay quiet.
-        orch.run("bmh", "random-ticks", "off")
-        froze_ticks = True
-        orch.remove_blocks(data.get("remove") or [])  # states the client cannot render (scene `oracle.exclude`)
-        t_server = time.monotonic()
-        host, port = "127.0.0.1", args.port
-        if args.connect_delay > 0:
-            proxy = DelayProxy(host, port, args.connect_delay).start()  # Forge's login race, see gtnh_client.proxy
-            port = proxy.port
-        jvm_args = [
-            "-Dbluemap.gtnh.exporter.mode=cameras",
-            f"-Dbluemap.gtnh.exporter.cameras={spec_file}",
-            f"-Dbluemap.gtnh.exporter.out={out}",
-        ]
-        with cameras.capture_settings(layout.minecraft_dir):
-            code = run_client(
-                layout, zip_path=default_zip(args.gtnh_pack), mods=[mod_jar], jvm_args=jvm_args, xmx=args.xmx,
-                timeout=args.timeout, username=cameras.USERNAME,
-                log=args.log, extra_mods=[p.resolve() for p in args.extra_mod],
-                resource_packs=[p.resolve() for p in args.resource_pack], game_args=["--server", host, "--port", str(port)],
-            )
-        t_client = time.monotonic()
+        for i, group in enumerate(workers.split(jobs, args.parallel, cost=lambda job: job.cost), 1):
+            layout, stats = workers.sync_worker(base, i)
+            saves = cameras.prepare_saves(layout.minecraft_dir, group)
+            for job in group:
+                job.out.mkdir(parents=True, exist_ok=True)
+                cameras.clean_outputs(job.out, job.cameras)
+            session = layout.instance_dir / cameras.SESSION
+            session.unlink(missing_ok=True)
+            spec_file = layout.instance_dir / cameras.SPEC
+            spec_file.write_text(json.dumps(cameras.build_spec(group, saves, session=session), indent=1) + "\n", encoding="utf-8")
+            print(f"[cameras] worker {i}: {layout.instance_dir} ({stats.copied} entries copied, {stats.removed} removed "
+                  f"to match {base.minecraft_dir}); {len(group)} job(s): {', '.join(job.scene for job in group)}", flush=True)
+            runs.append(WorkerRun(i, layout, jvm_args=[
+                "-Dbluemap.gtnh.exporter.mode=cameras",
+                f"-Dbluemap.gtnh.exporter.cameras={spec_file}",
+                "-Dfml.queryResult=confirm",  # answer FML's startup queries (e.g. missing blocks) without a GUI
+            ], jobs=group))
+        t_setup = time.monotonic()
+        codes = run_workers(
+            runs, zip_path=default_zip(args.gtnh_pack), mods=[mod_jar], extra_mods=[bmh_jar, *(p.resolve() for p in args.extra_mod)],
+            resource_packs=[p.resolve() for p in args.resource_pack], xmx=args.xmx, timeout=args.timeout,
+            username=cameras.USERNAME, kind="cameras", settings=cameras.capture_settings,
+        )
+        t_run = time.monotonic()
     finally:
-        if proxy:
-            proxy.close()
-        if started_server:
-            orch.run("stop", check=False)
-            orch.run("delete-level", check=False)
-        elif froze_ticks:
-            orch.run("bmh", "random-ticks", "on", check=False)
-    t_end = time.monotonic()
-    split = (
-        f"build {t_build - t0:.0f}s, server restore+start {t_server - t_build:.0f}s, "
-        f"client boot+join+captures {t_client - t_server:.0f}s, server stop {t_end - t_client:.0f}s"
-    )
-    report_file = out / cameras.REPORT
-    if report_file.is_file() and report_file.stat().st_mtime >= started_wall:
-        report = json.loads(report_file.read_text(encoding="utf-8"))
-        for result in report.get("results", []):
-            state = "captured" if result.get("captured") else f"FAILED: {result.get('error')}"
-            flags = "" if not result.get("captured") else (
-                ("" if result.get("settled") else ", NOT settled") + ("" if result.get("stable") else ", NOT stable")
-            )
-            print(f"[cameras] {result['name']}: {state}{flags} ({result.get('seconds', 0):.0f}s)")
-        if report.get("error"):
-            print(f"[cameras] client error: {report['error']}", file=sys.stderr)
-    problems = cameras.check_outputs(out, data, started_wall)
-    if code != 0 or problems:
-        print(f"[cameras] FAILED (client exit {code}): {'; '.join(problems) or 'see the client log'} ({split})", file=sys.stderr)
-        return code or 1
-    print(f"[cameras] OK: {len(data['cameras'])} cameras in {t_end - t0:.0f}s total ({split}); outputs in {out}")
+        for run in runs:
+            cameras.remove_saves(run.layout.minecraft_dir)
+    failed = []
+    for run in runs:
+        session_file = run.layout.instance_dir / cameras.SESSION
+        session = _read_fresh(session_file, started_wall)
+        if session is not None:
+            session["launcher"] = {"exit": run.code, "rssPeakMiB": round(run.rss_peak_kib / 1024), "log": str(run.log),
+                                   "wallSeconds": round(t_run - t_setup, 1)}
+            session_file.write_text(json.dumps(session, indent=1) + "\n", encoding="utf-8")
+        boot = f"boot {session['bootSeconds']:.0f}s" if session else "no session report"
+        print(f"[cameras] worker {run.index}: exit {run.code}, {boot}, peak RSS {run.rss_peak_kib / 1024 / 1024:.1f} GiB, "
+              f"log {run.log}")
+        for job in run.jobs:
+            report = _read_fresh(job.out / cameras.REPORT, started_wall) or {}
+            timings = report.get("timings", {})
+            print(f"[cameras]   {job.scene}: {report.get('seconds', 0):.0f}s (open {timings.get('open', 0):.0f}s, "
+                  f"join {timings.get('join', 0):.0f}s, cameras {timings.get('cameras', 0):.0f}s)")
+            for result in report.get("results", []):
+                state = "captured" if result.get("captured") else f"FAILED: {result.get('error')}"
+                flags = "" if not result.get("captured") else (
+                    ("" if result.get("settled") else ", NOT settled") + ("" if result.get("stable") else ", NOT stable")
+                )
+                print(f"[cameras]     {result['name']}: {state}{flags} ({result.get('seconds', 0):.1f}s, "
+                      f"{result.get('fps', 0):.0f} fps)")
+            problems = cameras.check_outputs(job.out, job.cameras, started_wall)
+            if problems:
+                failed.append(job.scene)
+                print(f"[cameras]   {job.scene} FAILED: {'; '.join(problems[:5])}", file=sys.stderr)
+    split = f"build {t_build - t0:.0f}s, setup {t_setup - t_build:.0f}s, clients {t_run - t_setup:.0f}s"
+    cameras_total = sum(len(job.cameras["cameras"]) for job in jobs)
+    if failed or any(codes) or not codes:
+        print(f"[cameras] FAILED: {len(failed)} of {len(jobs)} job(s) ({', '.join(failed) or 'see the client logs'}), "
+              f"client exits {codes} ({split})", file=sys.stderr)
+        return 1
+    print(f"[cameras] OK: {len(jobs)} job(s), {cameras_total} cameras on {len(runs)} worker(s) in {time.monotonic() - t0:.0f}s "
+          f"total ({split})")
     return 0
 
 
 def cmd_states(args: argparse.Namespace) -> int:
     """Reference renders of every block state for the per-state oracle: write the state list (vanilla from the
     fork's flattening table, modded from the pack's `gtnh/blocks.ndjson`), run the client in the exporter mod's
-    `states` mode, check the outputs."""
+    `states` mode (with `--parallel N`, N worker clients each draw a contiguous shard into the same output directory),
+    check the outputs."""
     started_wall = time.time()
     t0 = time.monotonic()
     ws = workspace()
@@ -426,37 +524,61 @@ def cmd_states(args: argparse.Namespace) -> int:
             raise CliError(f"{path} does not exist")
     if args.mod_jar and not args.mod_jar.is_file():
         raise CliError(f"--mod-jar {args.mod_jar} does not exist")
+    if args.parallel < 1:
+        raise CliError("--parallel must be at least 1")
     flattening = bluemap_repo() / states.FLATTENING_TSV
     mod_jar = args.mod_jar.resolve() if args.mod_jar else build_exporter_mod()
     t_build = time.monotonic()
-    layout = make_layout(args.client_dir, args.gtnh_pack)
-    if not layout.client_dir.exists():
-        prepare(layout, default_zip(args.gtnh_pack))
+    base = make_layout(args.client_dir, args.gtnh_pack)
+    if not base.client_dir.exists():
+        prepare(base, default_zip(args.gtnh_pack))
     if out.exists() and not args.only:
         shutil.rmtree(out)  # a full run starts clean: images of states that are no longer listed must not survive
     out.mkdir(parents=True, exist_ok=True)
+    (out / states.INDEX).unlink(missing_ok=True)
     states_file = out.parent / ("states.txt" if not args.only else "states-only.txt")
     count = states.write_states(pack, flattening, states_file, args.only)
     if count == 0:
         raise CliError(f"no state matches --only {args.only!r}")
     print(f"[states] {count} states from {flattening.name} and {pack.name} -> {states_file}", flush=True)
-    jvm_args = [
-        "-Dbluemap.gtnh.exporter.mode=states",
-        f"-Dbluemap.gtnh.exporter.out={out}",
-        f"-Dbluemap.gtnh.exporter.states={states_file}",
-    ]
-    code = run_client(
-        layout, zip_path=default_zip(args.gtnh_pack), mods=[mod_jar], jvm_args=jvm_args, xmx=args.xmx,
-        timeout=args.timeout, username="BlueMapExporter",
-        log=args.log, extra_mods=[p.resolve() for p in args.extra_mod],
-        resource_packs=[p.resolve() for p in args.resource_pack],
-    )
+    common = ["-Dbluemap.gtnh.exporter.mode=states", f"-Dbluemap.gtnh.exporter.out={out}"]
+    extra_mods = [p.resolve() for p in args.extra_mod]
+    resource_packs = [p.resolve() for p in args.resource_pack]
+    if args.parallel == 1:
+        code = run_client(
+            base, zip_path=default_zip(args.gtnh_pack), mods=[mod_jar],
+            jvm_args=[*common, f"-Dbluemap.gtnh.exporter.states={states_file}"], xmx=args.xmx, timeout=args.timeout,
+            username="BlueMapExporter", log=args.log, extra_mods=extra_mods, resource_packs=resource_packs,
+        )
+        codes = [code]
+    else:
+        runs = []
+        indexes = []
+        for i, shard in enumerate(states.shard_lines(states_file.read_text(encoding="utf-8"), args.parallel), 1):
+            layout, _ = workers.sync_worker(base, i)
+            shard_file = layout.instance_dir / "states-shard.txt"
+            shard_file.write_text("".join(shard), encoding="utf-8")
+            index = layout.instance_dir / "states-index.json"
+            index.unlink(missing_ok=True)
+            indexes.append(index)
+            print(f"[states] worker {i}: {len(shard)} states -> {layout.instance_dir}", flush=True)
+            runs.append(WorkerRun(i, layout, jvm_args=[
+                *common, f"-Dbluemap.gtnh.exporter.states={shard_file}", f"-Dbluemap.gtnh.exporter.statesIndex={index}",
+            ]))
+        codes = run_workers(
+            runs, zip_path=default_zip(args.gtnh_pack), mods=[mod_jar], extra_mods=extra_mods,
+            resource_packs=resource_packs, xmx=args.xmx, timeout=args.timeout, username="BlueMapExporter", kind="states",
+        )
+        for run in runs:
+            print(f"[states] worker {run.index}: exit {run.code}, peak RSS {run.rss_peak_kib / 1024 / 1024:.1f} GiB, log {run.log}")
+        if not any(codes):
+            states.merge_indexes(indexes, out / states.INDEX, started_wall)
     t_run = time.monotonic()
     split = f"build {t_build - t0:.0f}s, client boot+render {t_run - t_build:.0f}s"
     problems, summary = states.check_outputs(out, count, started_wall)
-    if code != 0 or problems:
-        print(f"[states] FAILED (client exit {code}): {'; '.join(problems) or 'see the client log'} ({split})", file=sys.stderr)
-        return code or 1
+    if any(codes) or problems:
+        print(f"[states] FAILED (client exit {codes}): {'; '.join(problems) or 'see the client log'} ({split})", file=sys.stderr)
+        return next((c for c in codes if c), 1)
     print(f"[states] OK: {summary['states']} states ({summary['errors']} with errors, {summary['blank']} blank, "
           f"{summary['tesr']} with a TESR), render {summary['seconds']:.0f}s, {t_run - t0:.0f}s total ({split}); "
           f"outputs in {out}")
@@ -531,23 +653,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pack-suffix", help="output pack name suffix: bluemap-gtnh-resources-<version>-<suffix>.zip")
     p.set_defaults(func=cmd_export)
 
-    p = add_parser("cameras", help="reference screenshots of a scene world for the world-scene oracle (e2e oracle world)")
+    p = add_parser("cameras", help="reference screenshots of scene worlds for the world-scene oracle (e2e oracle world)")
     client_dir_arg(p)
-    p.add_argument("--scene", required=True, help="scene name (e2e scenes/<scene>.yaml, the pack version's worlds/<scene>)")
-    p.add_argument("--variant", default="default", help="oracle variant, only for the default paths (default %(default)s)")
-    p.add_argument("--cameras", type=Path, help="camera list (default WS/out/oracle[-<version>]/<variant>/worlds/<scene>/cameras.json, written by `e2e oracle world`)")
-    p.add_argument("--out", type=Path, help="output dir (default WS/out/oracle[-<version>]/<variant>/worlds/<scene>/client)")
+    p.add_argument("--jobs", type=Path, required=True, help='jobs file {"jobs": [{"scene", "world", "cameras", "out", "remove", "freeze_random_ticks"}]} (written by `e2e oracle world`)')
+    p.add_argument("--parallel", type=int, default=DEFAULT_PARALLEL, help="worker clients (WS/clients/<client>-worker-<i>) the jobs are split across (default %(default)s)")
     p.add_argument("--resource-pack", type=Path, action="append", default=[], help="client resource pack enabled for this run only, first = highest priority; repeatable")
     p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this run only; repeatable")
     p.add_argument("--mod-jar", type=Path, help="use this exporter jar instead of building it with gradle")
-    p.add_argument("--server-dir", help="server directory under WS/servers (default gtnh-<version>)")
-    p.add_argument("--port", type=int, help="server port (default: the pack version's, 25569 for 2.9.0)")
-    p.add_argument("--rcon-port", type=int, help="server RCON port (default: the pack version's, 25579 for 2.9.0)")
-    p.add_argument("--running-server", action="store_true", help="use the server already running the scene world (no restore/start/stop)")
-    p.add_argument("--connect-delay", type=float, default=2.0, help="hold the server's first reply this many seconds (Forge login race, see `play`); 0 = direct (default %(default)s)")
+    p.add_argument("--bmh-jar", type=Path, help="harness mod jar loaded into the clients (default: the newest bmh-*.jar in WS/servers/gtnh-<version>/mods)")
     p.add_argument("--xmx", default="10G", help="client heap size (default %(default)s)")
-    p.add_argument("--timeout", type=float, default=3600, help="kill the client after this many seconds, exit 124 (default %(default)s)")
-    p.add_argument("--log", type=Path, help="client log file (default <client-dir>/logs-launcher/client-<timestamp>.log)")
+    p.add_argument("--timeout", type=float, default=3600, help="kill the clients after this many seconds, exit 124 (default %(default)s)")
     p.set_defaults(func=cmd_cameras)
 
     p = add_parser("states", help="reference renders of every block state for the per-state oracle (e2e oracle states)")
@@ -559,9 +674,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resource-pack", type=Path, action="append", default=[], help="client resource pack enabled for this run only, first = highest priority; repeatable")
     p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this run only; repeatable")
     p.add_argument("--mod-jar", type=Path, help="use this exporter jar instead of building it with gradle")
+    p.add_argument("--parallel", type=int, default=1, help="worker clients (WS/clients/<client>-worker-<i>) each drawing a contiguous shard (default %(default)s: the client itself)")
     p.add_argument("--xmx", default="10G", help="client heap size (default %(default)s)")
     p.add_argument("--timeout", type=float, default=3600, help="kill the client after this many seconds, exit 124 (default %(default)s)")
-    p.add_argument("--log", type=Path, help="client log file (default <client-dir>/logs-launcher/client-<timestamp>.log)")
+    p.add_argument("--log", type=Path, help="client log file with --parallel 1 (default <client-dir>/logs-launcher/client-<timestamp>.log)")
     p.set_defaults(func=cmd_states)
 
     def coverage_args(p: argparse.ArgumentParser) -> None:
@@ -702,10 +818,6 @@ def resolve_pack(args: argparse.Namespace) -> None:
         raise CliError(str(e)) from e
     args.gtnh_pack = pack
     ws = workspace()
-    if args.command == "cameras":
-        args.server_dir = args.server_dir or pack.server
-        args.port = args.port or pack.server_port
-        args.rcon_port = args.rcon_port or pack.rcon_port
     if args.command in ("coverage", "screens"):
         exporter = pack.dir(ws, "out/exporter")
         args.scene = args.scene or pack.dir(ws, "out/scenes") / "gtnh-zoo"
@@ -716,12 +828,19 @@ def resolve_pack(args: argparse.Namespace) -> None:
             args.shots = args.shots or exporter / "screens"
 
 
+# Commands that launch clients: each holds the workspace's client lock (gtnh_client.lock) for its whole run.
+CLIENT_COMMANDS = frozenset({"run", "play", "export", "cameras", "states"})
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(_join_dash_values(sys.argv[1:] if argv is None else argv))
     try:
         resolve_pack(args)
-        sys.exit(args.func(args))
-    except (CliError, cameras.CamerasError, states.StatesError, PrepareError, ProfileError, DownloadError,
+        held = lock.client_lock(workspace()) if args.command in CLIENT_COMMANDS else contextlib.nullcontext()
+        with held:
+            code = args.func(args)
+        sys.exit(code)
+    except (CliError, cameras.CamerasError, states.StatesError, PrepareError, ProfileError, DownloadError, lock.LockBusy,
             FileNotFoundError, subprocess.CalledProcessError) as e:  # fmt: skip
         print(f"gtnh-client: error: {e}", file=sys.stderr)
         sys.exit(1)

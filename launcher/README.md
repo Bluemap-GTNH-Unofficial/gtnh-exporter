@@ -125,58 +125,78 @@ Values that start with `-` work as `--jvm-arg -Dfoo=bar` as well as `--jvm-arg=-
    writes), else the pack version.
    It then prints the total wall time with the build/prepare/run split. Every failure exits non-zero.
 
-### `cameras --scene NAME [--pack-version V] [--variant default] [--cameras FILE] [--out DIR] [--client-dir DIR] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--server-dir gtnh-<V>] [--port 25569] [--rcon-port 25579] [--running-server] [--connect-delay 2] [--xmx 10G] [--timeout 3600] [--log FILE]`
+### `cameras --jobs FILE [--pack-version V] [--client-dir DIR] [--parallel 2] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--bmh-jar JAR] [--xmx 10G] [--timeout 3600]`
 
-The server defaults follow the pack version: `gtnh-2.9.0` on 25569 / 25579.
+Reference screenshots of scene worlds for the world-scene oracle. `uv run e2e oracle world` (sibling `e2e/` checkout)
+writes the jobs file and runs this command for the references its cache does not have, once per variant. No server
+is involved: each client opens the scene worlds as single-player saves.
 
-Reference screenshots of a scene world for the world-scene oracle. `uv run e2e oracle world` (sibling `e2e/`
-checkout) writes the camera list and runs this command with the variant's flags; it also works on its own once
-`cameras.json` exists.
-
-1. Reads the camera list, default `WS/out/oracle-<V>/<variant>/worlds/<scene>/cameras.json` (`--variant` only picks the
-   default paths): `{"format": 1, "scene", "world", "box", "cameras": [{"name", "eye": [x, y, z], "yaw", "pitch",
-   "fov", "width", "height"}]}` with Minecraft angles in degrees (yaw 0 = south, 90 = west; pitch 90 = down) and the
-   vertical FOV. `box` is the scene's dump box; its chunks must be loaded before a camera is captured.
-2. Builds the exporter mod unless `--mod-jar`, and writes `spec.json` into the output directory: the cameras, RCON
-   access (host, port, path of the server's `.rcon-password`), the server's `view-distance` and the settle settings.
-3. Unless `--running-server`: copies `WS/worlds-<V>/<world>` into the level folder `oracle-<scene>` of
-   `WS/servers/<server-dir>` and starts the server, both with the sibling orchestrator (`uv run orch --level
-   oracle-<scene> ... restore <world>`, `... start`). It refuses to run if that server is already running. Then, also
-   with `--running-server`, turns random ticks off on the server (`orch bmh random-ticks off`, needs the harness with
-   that command): the scene stays as dumped while the player is near it, and blocks whose random tick crashes on zoo
-   metas (Binnie Botany soil) stay quiet. With `--running-server` they are turned back on at the end. Cells listed
-   under `remove` (the e2e scene's `oracle.exclude`: block states whose client rendering throws, which fails their
-   whole chunk's mesh) are then set to air with `bmh set` in one `orch rcon` call; with `--running-server` this edits
-   that server's world.
-4. For this run only (both files restored afterwards): `options.txt` gets `ao:0`, `mipmapLevels:0`,
+1. Reads the jobs file and checks every job before anything runs: `{"jobs": [{"scene", "world": <world snapshot dir
+   with level.dat>, "cameras": <cameras.json>, "out": <dir>, "remove": [[x, y, z], ...], "freeze_random_ticks":
+   true}]}`. Relative paths are relative to the file; `remove` defaults to the camera list's, `freeze_random_ticks` to
+   true; two jobs may not share an `out`. The camera list (`cameras.json`, written by `e2e oracle world`) is `{"format":
+   1, "scene", "world", "box", "cameras": [{"name", "eye": [x, y, z], "yaw", "pitch", "fov", "width", "height"}],
+   "remove"}` with Minecraft angles in degrees (yaw 0 = south, 90 = west; pitch 90 = down) and the vertical FOV.
+   `box` is the scene's dump box. `remove` lists cells set to air first (the e2e scene's `oracle.exclude`: block states
+   whose client rendering throws, which fails their whole chunk's mesh).
+2. Builds the exporter mod unless `--mod-jar`. The harness mod `bmh` (`--bmh-jar`, default the newest `bmh-*.jar` in
+   `WS/servers/gtnh-<V>/mods/`, the jar the scene server runs) is installed into the clients for this run like an
+   `--extra-mod`: it keeps the scene's frozen tile entities unticked and does the random-tick switch and the removals
+   inside the integrated server.
+3. Splits the jobs across `--parallel` workers (largest first onto the least loaded worker, cost 12 s per job plus
+   2 s per camera; never more workers than jobs). Worker `i` is the instance `WS/clients/<client>-worker-<i>/` (see
+   Layout): its `.minecraft` is mirrored from the `--client-dir` first, each job's world is copied into its
+   `saves/oracle-<n>-<scene>/` (APFS clones; `worlds-<V>` is never touched), and the stale outputs of the job's cameras
+   in `out` are removed. `<worker>/cameras-spec.json` lists the worker's jobs for the mod.
+4. For this run only (both files restored afterwards, in every worker): `options.txt` gets `ao:0`, `mipmapLevels:0`,
    `anisotropicFiltering:1`, `renderDistance:12`, `fboEnable:true`, `fancyGraphics:true`, `clouds:false`,
-   `bobView:false`, `particles:2`, `anaglyph3d:false`, `pauseOnLostFocus:false`; Angelica's
-   `config/angelica-options.json` gets `texture_filter_mode: NONE`, `texel_sampling: NEAREST` and
+   `bobView:false`, `particles:2`, `anaglyph3d:false`, `pauseOnLostFocus:false`, `showInventoryAchievementHint:false`;
+   Angelica's `config/angelica-options.json` gets `texture_filter_mode: NONE`, `texel_sampling: NEAREST` and
    `use_fog_occlusion: false`.
-5. Runs the client (`--resource-pack` and `--extra-mod` installed for this run only, as with `export`) as
-   `BlueMapCamera` with `-Dbluemap.gtnh.exporter.mode=cameras`, `-Dbluemap.gtnh.exporter.cameras=<spec.json>`,
-   `-Dbluemap.gtnh.exporter.out=<out>` and `--server` through the login delay proxy of `play`.
-6. Stops the server and deletes `oracle-<scene>` again, prints each camera's result and the wall time split (build,
-   server restore and start, client boot and join and captures, server stop). Exit 1 if a camera failed or an
-   output is missing or older than the run.
+5. Starts all worker clients at once (`--resource-pack` and `--extra-mod` installed for this run only, as with `export`)
+   as `BlueMapCamera` with `-Dbluemap.gtnh.exporter.mode=cameras`, `-Dbluemap.gtnh.exporter.cameras=<spec>` and
+   `-Dfml.queryResult=confirm`. Console lines carry a `[w<i>]` prefix; each worker logs to
+   `<worker>/logs-launcher/cameras-<timestamp>.log`. The launcher samples each client's resident memory.
+6. Deletes the saves, prints per worker the boot time, exit code and peak memory, per job the time split (open, join,
+   cameras) and per camera the result and frame rate, and adds `launcher` (exit, peak RSS, log) to
+   `<worker>/cameras-session.json`. Exit 0 only if every job's `cameras-report.json` is fresh, has no error, carries
+   the current `CAPTURE_VERSION` and every camera's three files exist.
 
-The mod's camera mode (`oracle/CameraCapture.kt`) switches the player to creative flight over RCON, sets noon and
-clear weather, then per camera: `tp`s the player there over RCON, pins position and rotation on the client every
-tick and frame, waits until every chunk of the scene box within the view distance is loaded and Angelica's chunk
-renderer reports no pending work (`isTerrainRenderComplete`, else vanilla's update list) for 60 ticks, then until 3
-frames 10 ticks apart differ in at most 0.05 % of the pixels, and captures the next frame. Capture conditions: game
-framebuffer resized to the camera size (the minimized window is not touched), no GUI, hand or block outline; flat
-lighting with a white lightmap (full brightness; vanilla's face shade 1.0 up, 0.5 down, 0.8 north/south, 0.6
-west/east stays); fog pushed beyond the far plane; FOV exactly the camera's (the flying FOV boost cancelled); block
-atlas animations pinned to their first frame.
+The mod's camera mode (`oracle/CameraCapture.kt`), one client session per worker: from the main menu it opens each job's
+save as a single-player world. Before the player joins, the integrated server runs `bmh random-ticks off` (or `on` if
+the job says so), `bmh set 0 x y z minecraft:air 0` per removed cell, `time set 6000`, `weather clear 1000000`,
+`gamerule doDaylightCycle false` and `gamerule doMobSpawning false`. Its chunk radius is 8 chunks (`VIEW_DISTANCE`,
+the dedicated scene servers' `view-distance`), so a camera sees the chunks it always saw with the 12-chunk client render
+distance. The player gets creative flight; then per camera:
 
-Outputs (`--out`, default `WS/out/oracle-<V>/<variant>/worlds/<scene>/client/`): `<view>.png`; `<view>.depth.bin`
-(float32 little endian, rows top to bottom, OpenGL window depth 0..1, 1 = nothing drawn); `<view>.json` with the
-projection and modelview matrices (column-major, read at `RenderWorldLastEvent`; world to eye is
-`modelview * translate(-camera)`), the camera position, the settle and stability record and timings;
-`cameras-report.json`; `spec.json`.
+- the server loads the destination's chunk square and `tp`s the player there; the client pins position and rotation
+  every tick and frame and sets the FOV at once;
+- it waits until every chunk of the scene box in range and every chunk the server has sent the player is on the
+  client, for 5 ticks (`loadTicks`). After 60 s (`cameraTimeoutSeconds`) the camera fails with the missing counts;
+- it freezes the game: an invisible screen pauses the single-player game, so the world, entities, tile entities,
+  particles and texture animations stop and the integrated server stops ticking. Partial ticks are 0 and the client's
+  total world time is 0, so animated tile entity renderers stand at "frame 0";
+- it waits until Angelica's chunk renderer reports no pending work (`isTerrainRenderComplete`, else vanilla's update
+  list) and 3 frames at least 0.1 s apart differ in at most 0.05 % of the pixels, and captures the last of them. After
+  30 s (`stableTimeoutSeconds`) the frame is captured anyway and marked not stable.
 
-### `states [--pack-version V] [--variant default] [--out DIR] [--states-from PACK] [--only REGEX] [--client-dir DIR] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--xmx 10G] [--timeout 3600] [--log FILE]`
+After the last camera it returns to the main menu (the integrated server saves and stops) and opens the next save.
+Capture conditions: game framebuffer resized to the camera size (the minimized window is not touched), no GUI, hand or
+block outline; flat lighting with a white lightmap (full brightness; vanilla's face shade 1.0 up, 0.5 down, 0.8
+north/south, 0.6 west/east stays); fog pushed beyond the far plane; FOV exactly the camera's (the flying FOV boost
+cancelled); block atlas animations pinned to their first frame; particles cleared every frame.
+
+Outputs per job, in its `out`: `<view>.png`; `<view>.depth.bin` (float32 little endian, rows top to bottom, OpenGL
+window depth 0..1, 1 = nothing drawn); `<view>.json` with the projection and modelview matrices (column-major, read at
+`RenderWorldLastEvent`; world to eye is `modelview * translate(-camera)`), the camera position, the load and stability
+record, frames and frame rate; `cameras-report.json` (`scene`, `capture_version`, `cameras`, `captured`, `failed`,
+`error`, `seconds`, `timings` {open, join, cameras, leave}, `settings`, `results[]` {name, captured, error, settled,
+stable, seconds, loadSeconds, fps}). Per worker: `<worker>/cameras-session.json` (boot time, per-job results).
+
+`CAPTURE_VERSION` in `gtnh_client/cameras.py` versions all of this (the e2e reference cache keys on it): bump it when
+anything that can change a capture changes.
+
+### `states [--pack-version V] [--variant default] [--out DIR] [--states-from PACK] [--only REGEX] [--client-dir DIR] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--parallel 1] [--xmx 10G] [--timeout 3600] [--log FILE]`
 
 Reference renders of every block state for the per-state rendering oracle (`uv run e2e oracle states` in the
 sibling `e2e/` checkout compares them with BlueMap; the e2e README has the whole procedure).
@@ -192,8 +212,14 @@ sibling `e2e/` checkout compares them with BlueMap; the e2e README has the whole
    `-Dbluemap.gtnh.exporter.mode=states`, `-Dbluemap.gtnh.exporter.states=<list>` and
    `-Dbluemap.gtnh.exporter.out=<out>` (default `WS/out/oracle-<V>/<variant>/states/client/`). The mod draws the states
    at the main menu and quits (see the exporter README, "Per-state oracle").
+   With `--parallel N` (N > 1) the list is cut into N contiguous shards of whole 64-state batches (the mod's
+   framebuffer batch, so every state is drawn in the same batch as in a single run); worker `i`
+   (`WS/clients/<client>-worker-<i>/`, see Layout) draws its shard straight into `<out>` and writes its index to
+   `<worker>/states-index.json` (`-Dbluemap.gtnh.exporter.statesIndex`); the launcher merges the indexes in shard order
+   into `<out>/index.json` (`seconds` = the slowest shard).
 4. Requires `<out>/index.json` newer than the run with one entry and one image per listed state; prints the
    counts of states with render errors, blank states and states with a tile-entity special renderer.
+   `STATES_CAPTURE_VERSION` in `gtnh_client/states.py` versions the per-state capture for the e2e reference cache.
 
 Variants: `default` as above; `modernity` with `--client-dir WS/clients/gtnh-modernity-<V> --resource-pack
 WS/downloads/modernity/Modernity-2.9.x-<sha>.zip --extra-mod WS/downloads/modernity/MyCTMLib-<v>-29x.jar --variant
@@ -215,10 +241,26 @@ WS/clients/gtnh-2.9.0/                 client dir (unpacked instance)
   natives/                             extracted native libs (jinput)
   logs-launcher/client-*.log
   .gtnh-client-unpacked.json           unpack marker
+WS/clients/gtnh-2.9.0-worker-<i>/      worker instance of `cameras`/`states --parallel` (any base client: <client>-worker-<i>)
+  .minecraft/                          own game dir, mirrored from the base's before every run except its saves/, logs/,
+                                       crash-reports/, screenshots/, backups/, mods-disabled/
+  logs-launcher/cameras-*.log          worker logs
+  cameras-spec.json, cameras-session.json, states-shard.txt, states-index.json
+WS/locks/client.lock                   client lock (see below)
 ```
+
+A worker runs the base client's pack (patches, instance libraries and natives of the base directory, libraries and
+assets from the shared cache) with its own game directory. The mirror compares size and modification time, removes
+what the base no longer has and copies with APFS clones (`clonefile`, copy on write), so a worker costs almost no disk
+and a sync takes about a second; the mods' boot-time config rewrites in a worker are undone by the next sync.
 
 Downloads are written to a `.part` file, checked against SHA-1 and size, and renamed into place. 16
 downloads run in parallel. `prepare` re-hashes cached files, which takes about 0.1 s for all of them.
+
+Client lock: `run`, `play`, `export`, `cameras` and `states` hold `WS/locks/client.lock` (`gtnh_client.lock`, `flock`)
+for their whole run, one hold for all workers of a parallel run. The holder record (pid, host, command, start, cwd) is
+in the file; a second command prints it and waits, `BMGTNH_CLIENT_LOCK_WAIT=<seconds>` bounds the wait (`0`: fail at
+once).
 
 ## Measured timings (MacBook arm64, 18 cores, 64 GB, GTNH 2.9.0)
 
@@ -242,7 +284,10 @@ Boot milestones in the log:
 - native classifier resolution and classpath order, from the real patches read out of the instance zip
   (these tests are skipped when the zip is absent),
 - the offline UUID, checked against Java's `UUID.nameUUIDFromBytes`,
-- `cameras`: camera list validation, the spec, `view-distance`, the capture settings (written and restored, also on
-  errors) and the output checks.
-- `states`: the state list (vanilla from the flattening table, then the pack's `gtnh/blocks.ndjson`, `--only`) and the
-  output checks.
+- `cameras`: camera list and jobs file validation (paths, defaults, bad jobs), the saves (copies, stale ones removed,
+  snapshot untouched), the spec, the capture settings (written and restored, also on errors), the output checks and
+  the parser,
+- `workers`: job splitting, the worker layout and the game directory mirror,
+- `states`: the state list (vanilla from the flattening table, then the pack's `gtnh/blocks.ndjson`, `--only`), the
+  shards, the index merge and the output checks,
+- `lock`: the client lock.

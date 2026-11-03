@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Callable
 
 from gtnh_client.instance import Layout
 from gtnh_client.profile import Profile, classpath
@@ -193,40 +194,104 @@ def _kill_tree(proc: subprocess.Popen) -> None:
     proc.wait()
 
 
+class ClientProcess:
+    """A client command in its own process group; merged stdout/stderr go to `log_file` and, each line prefixed with
+    `prefix`, to the console."""
+
+    def __init__(self, cmd: list[str], *, cwd: Path, log_file: Path, prefix: str = "") -> None:
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        self.log_file = log_file
+        self._log = log_file.open("wb")
+        self._log.write(f"# cwd: {cwd}\n# cmd: {subprocess.list2cmdline(cmd)}\n".encode())
+        self._log.flush()
+        self._prefix = prefix.encode()
+        self.started = time.monotonic()
+        self.proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        self.code: int | None = None
+        self._reader = threading.Thread(target=self._pump, daemon=True)
+        self._reader.start()
+
+    def _pump(self) -> None:
+        assert self.proc.stdout is not None
+        console: dict = {}
+        for line in self.proc.stdout:
+            _console_write(self._prefix + line, console)
+            self._log.write(line)
+            self._log.flush()
+
+    @property
+    def pgid(self) -> int:
+        return self.proc.pid  # start_new_session: the child leads its own group
+
+    def poll(self) -> int | None:
+        return self.proc.poll()
+
+    def kill(self) -> None:
+        _kill_tree(self.proc)
+
+    def finish(self, code: int) -> int:
+        """Records the exit code in the log and closes it."""
+        self.code = code
+        self._reader.join(timeout=10)
+        self._log.write(f"# exit {code} after {time.monotonic() - self.started:.1f}s\n".encode())
+        self._log.close()
+        return code
+
+
 def run_process(cmd: list[str], *, cwd: Path, log_file: Path, timeout: float) -> int:
     """Run `cmd` in its own process group, tee merged stdout/stderr to the console and `log_file`."""
-    log_file.parent.mkdir(parents=True, exist_ok=True)
-    with log_file.open("wb") as log:
-        header = f"# cwd: {cwd}\n# cmd: {subprocess.list2cmdline(cmd)}\n".encode()
-        log.write(header)
-        log.flush()
-        proc = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
-        assert proc.stdout is not None
+    return run_processes([ClientProcess(cmd, cwd=cwd, log_file=log_file)], timeout=timeout)[0]
 
-        def pump() -> None:
-            console: dict = {}
-            for line in proc.stdout:
-                _console_write(line, console)
-                log.write(line)
-                log.flush()
 
-        reader = threading.Thread(target=pump, daemon=True)
-        reader.start()
-        start = time.monotonic()
-        try:
-            code = proc.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            print(f"[run] timeout after {timeout:.0f}s; killing process tree", flush=True)
-            _kill_tree(proc)
-            code = TIMEOUT_EXIT
-        except KeyboardInterrupt as interrupt:
-            print("[run] interrupted; killing process tree", flush=True)
-            _kill_tree(proc)
-            # 128 + signal number: 130 for Ctrl-C (SIGINT), 143 for SIGTERM, 129 for SIGHUP
-            code = 128 + getattr(interrupt, "signum", signal.SIGINT)
-        reader.join(timeout=10)
-        log.write(f"# exit {code} after {time.monotonic() - start:.1f}s\n".encode())
-    return code
+def run_processes(procs: list[ClientProcess], *, timeout: float, sample: Callable[[], None] | None = None) -> list[int]:
+    """Waits for every process. When `timeout` expires every process group still running gets SIGTERM, then SIGKILL,
+    and exit code 124; Ctrl-C / SIGTERM / SIGHUP (as KeyboardInterrupt) kill them all with 128 + the signal number.
+    `sample` is called about every 2 s while they run."""
+    deadline = min(p.started for p in procs) + timeout
+    next_sample = 0.0
+    try:
+        while True:
+            running = [p for p in procs if p.code is None]
+            for p in running:
+                code = p.poll()
+                if code is not None:
+                    p.finish(code)
+            running = [p for p in procs if p.code is None]
+            if not running:
+                break
+            if time.monotonic() > deadline:
+                print(f"[run] timeout after {timeout:.0f}s; killing {len(running)} process tree(s)", flush=True)
+                for p in running:
+                    p.kill()
+                    p.finish(TIMEOUT_EXIT)
+                break
+            if sample is not None and time.monotonic() >= next_sample:
+                sample()
+                next_sample = time.monotonic() + 2.0
+            time.sleep(0.2)
+    except KeyboardInterrupt as interrupt:
+        print("[run] interrupted; killing process tree(s)", flush=True)
+        # 128 + signal number: 130 for Ctrl-C (SIGINT), 143 for SIGTERM, 129 for SIGHUP
+        code = 128 + getattr(interrupt, "signum", signal.SIGINT)
+        for p in procs:
+            if p.code is None:
+                p.kill()
+                p.finish(code)
+    return [p.code if p.code is not None else 1 for p in procs]
+
+
+def group_rss_kib() -> dict[int, int]:
+    """Resident set size in KiB per process group (`ps -A -o pgid=,rss=`), empty if ps fails."""
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pgid=,rss="], capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    totals: dict[int, int] = {}
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            totals[int(parts[0])] = totals.get(int(parts[0]), 0) + int(parts[1])
+    return totals
 
 
 def _console_write(line: bytes, state: dict) -> None:

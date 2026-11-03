@@ -38,18 +38,86 @@ def test_read_cameras_validates(tmp_path: Path):
         cameras.read_cameras(tmp_path / "missing.json")
 
 
-def test_build_spec_adds_rcon_and_settle_settings(tmp_path: Path):
-    spec = cameras.build_spec(CAMERAS, rcon_port=25578, password_file=tmp_path / ".rcon-password", view_distance=8)
-    assert spec["rcon"] == {"host": "127.0.0.1", "port": 25578, "passwordFile": str(tmp_path / ".rcon-password")}
-    assert spec["viewDistance"] == 8 and spec["renderDistance"] == 12
-    assert spec["cameras"] == CAMERAS["cameras"] and spec["box"] == CAMERAS["box"]
-    assert spec["stableFrames"] >= 2 and spec["settleTicks"] > 0
+def _world(path: Path) -> Path:
+    (path / "region").mkdir(parents=True)
+    (path / "level.dat").write_bytes(b"level")
+    (path / "region" / "r.0.0.mca").write_bytes(b"chunks")
+    (path / "session.lock").write_bytes(b"lock")
+    return path
 
 
-def test_server_view_distance(tmp_path: Path):
-    assert cameras.server_view_distance(tmp_path) == 10
-    (tmp_path / "server.properties").write_text("#x\nview-distance=8\nlevel-name=World\n")
-    assert cameras.server_view_distance(tmp_path) == 8
+def _jobs(tmp_path: Path, *entries: dict) -> Path:
+    return _write(tmp_path / "jobs.json", {"jobs": list(entries)})
+
+
+def test_read_jobs_resolves_paths_and_defaults(tmp_path: Path):
+    world = _world(tmp_path / "worlds" / "vanilla-zoo")
+    cameras_file = _write(tmp_path / "cameras.json", {**CAMERAS, "remove": [[1, 5, 2]]})
+    jobs_file = _jobs(tmp_path, {"scene": "vanilla-zoo", "world": "worlds/vanilla-zoo", "cameras": str(cameras_file),
+                                 "out": "out/a"})
+    [job] = cameras.read_jobs(jobs_file)
+    assert (job.scene, job.world, job.cameras_file, job.out) == ("vanilla-zoo", world, cameras_file, tmp_path / "out" / "a")
+    assert job.remove == [[1, 5, 2]] and job.freeze_random_ticks is True  # remove from the camera list
+    assert job.cameras["cameras"] == CAMERAS["cameras"]
+    _jobs(tmp_path, {"scene": "vanilla-zoo", "world": str(world), "cameras": str(cameras_file), "out": "o",
+                     "remove": [], "freeze_random_ticks": False})
+    [job] = cameras.read_jobs(jobs_file)
+    assert job.remove == [] and job.freeze_random_ticks is False
+
+
+@pytest.mark.parametrize(("change", "message"), [
+    ({"scene": "gt-ores"}, "is for scene vanilla-zoo"),
+    ({"world": "nowhere"}, "is not a world"),
+    ({"cameras": "missing.json"}, "does not exist"),
+    ({"remove": [[1, 2]]}, "remove must be"),
+    ({"remove": [[1, 2, True]]}, "remove must be"),
+    ({"freeze_random_ticks": "yes"}, "freeze_random_ticks"),
+    ({"out": None}, "must be a path"),
+])
+def test_read_jobs_rejects_bad_jobs(tmp_path: Path, change: dict, message: str):
+    _world(tmp_path / "w")
+    _write(tmp_path / "cameras.json", CAMERAS)
+    job = {"scene": "vanilla-zoo", "world": "w", "cameras": "cameras.json", "out": "o"} | change
+    with pytest.raises(cameras.CamerasError, match=message):
+        cameras.read_jobs(_jobs(tmp_path, job))
+
+
+def test_read_jobs_rejects_empty_and_shared_outputs(tmp_path: Path):
+    _world(tmp_path / "w")
+    _write(tmp_path / "cameras.json", CAMERAS)
+    with pytest.raises(cameras.CamerasError, match="at least one job"):
+        cameras.read_jobs(_jobs(tmp_path))
+    with pytest.raises(cameras.CamerasError, match="does not exist"):
+        cameras.read_jobs(tmp_path / "nope.json")
+    job = {"scene": "vanilla-zoo", "world": "w", "cameras": "cameras.json", "out": "o"}
+    with pytest.raises(cameras.CamerasError, match="used by another job"):
+        cameras.read_jobs(_jobs(tmp_path, job, job))
+
+
+def test_saves_are_copies_and_the_spec_lists_them(tmp_path: Path):
+    world = _world(tmp_path / "w")
+    mc = tmp_path / ".minecraft"
+    (mc / "saves" / "oracle-9-stale").mkdir(parents=True)
+    (mc / "saves" / "NEI").mkdir()
+    _write(tmp_path / "cameras.json", CAMERAS)
+    jobs = cameras.read_jobs(_jobs(tmp_path, {"scene": "vanilla-zoo", "world": "w", "cameras": "cameras.json", "out": "a"},
+                                   {"scene": "vanilla-zoo", "world": "w", "cameras": "cameras.json", "out": "b"}))
+    saves = cameras.prepare_saves(mc, jobs)
+    assert saves == ["oracle-1-vanilla-zoo", "oracle-2-vanilla-zoo"]
+    assert sorted(p.name for p in (mc / "saves").iterdir()) == ["NEI", *saves]  # stale save gone, others kept
+    copy = mc / "saves" / saves[0]
+    assert (copy / "region" / "r.0.0.mca").read_bytes() == b"chunks" and not (copy / "session.lock").exists()
+    (copy / "level.dat").write_bytes(b"changed by the game")
+    assert (world / "level.dat").read_bytes() == b"level" and (world / "session.lock").exists()  # snapshot untouched
+
+    spec = cameras.build_spec(jobs, saves, session=tmp_path / "session.json")
+    assert spec["captureVersion"] == cameras.CAPTURE_VERSION and spec["viewDistance"] == cameras.VIEW_DISTANCE == 8
+    assert spec["renderDistance"] == 12 and spec["stableFrames"] >= 2 and "settleTicks" not in spec
+    assert [j["save"] for j in spec["jobs"]] == saves
+    assert spec["jobs"][0] == {"scene": "vanilla-zoo", "save": saves[0], "box": CAMERAS["box"], "cameras": CAMERAS["cameras"],
+                               "remove": [], "freezeRandomTicks": True, "out": str(tmp_path / "a")}
+    cameras.remove_saves(mc)
+    assert [p.name for p in (mc / "saves").iterdir()] == ["NEI"]
 
 
 def test_set_options_replaces_and_appends():
@@ -94,23 +162,28 @@ def test_outputs_are_cleaned_and_checked(tmp_path: Path):
     cameras.clean_outputs(tmp_path, CAMERAS)
     assert not any(tmp_path.iterdir())
     assert cameras.check_outputs(tmp_path, CAMERAS, started) == [f"{tmp_path / cameras.REPORT} missing or older than this run"]
-    (tmp_path / cameras.REPORT).write_text("{}")
+    _write(tmp_path / cameras.REPORT, {"capture_version": cameras.CAPTURE_VERSION})
     for suffix in (".png", ".depth.bin"):
         (tmp_path / f"south{suffix}").write_text("new")
     assert cameras.check_outputs(tmp_path, CAMERAS, started) == [f"{tmp_path / 'south.json'} missing or stale"]
     (tmp_path / "south.json").write_text("{}")
+    assert cameras.check_outputs(tmp_path, CAMERAS, started) == []
     old = started - 100
     os.utime(tmp_path / "south.png", (old, old))
     assert cameras.check_outputs(tmp_path, CAMERAS, started) == [f"{tmp_path / 'south.png'} missing or stale"]
+    os.utime(tmp_path / "south.png")
+    _write(tmp_path / cameras.REPORT, {"capture_version": 1, "error": "disconnected"})
+    assert cameras.check_outputs(tmp_path, CAMERAS, started) == [
+        "job error: disconnected", f"{tmp_path / cameras.REPORT}: capture_version 1, expected {cameras.CAPTURE_VERSION}"]
 
 
 def test_cameras_parser(monkeypatch):
     monkeypatch.delenv("BMGTNH_PACK_VERSION", raising=False)
     args = build_parser().parse_args(
-        ["cameras", "--scene", "gt-pipes", "--resource-pack", "a.zip", "--extra-mod", "b.jar", "--port", "25568"]
+        ["cameras", "--jobs", "j.json", "--resource-pack", "a.zip", "--extra-mod", "b.jar", "--parallel", "3"]
     )
     resolve_pack(args)
-    assert args.scene == "gt-pipes" and args.variant == "default"
+    assert args.jobs == Path("j.json") and args.parallel == 3 and args.bmh_jar is None
     assert args.resource_pack == [Path("a.zip")] and args.extra_mod == [Path("b.jar")]
-    # --port given, the RCON port and server directory follow the default pack version
-    assert args.port == 25568 and args.rcon_port == 25579 and args.server_dir == "gtnh-2.9.0" and not args.running_server
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["cameras", "--scene", "gt-pipes"])  # the single-scene server mode is gone

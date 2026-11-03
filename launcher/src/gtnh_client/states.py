@@ -11,6 +11,12 @@ from pathlib import Path
 BLOCKS_NDJSON = "gtnh/blocks.ndjson"
 FLATTENING_TSV = "legacy/src/main/resources/de/bluecolored/bluemap/gtnh/legacy/flattening_1_7_10.tsv"
 INDEX = "index.json"
+# Version of the per-state capture (the mod's StateCapture and its settings): bump it whenever it can change the
+# outputs. The e2e reference cache reads this literal (with `ast`) into its keys.
+STATES_CAPTURE_VERSION = 1
+# StateCapture draws this many states per framebuffer batch; shards start on a batch boundary, so every state is drawn
+# in the same batch as in a single-client run.
+BATCH = 64
 
 
 class StatesError(Exception):
@@ -61,6 +67,40 @@ def write_states(pack: Path, flattening_tsv: Path, out: Path, only: str | None =
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("".join(lines), encoding="utf-8")
     return len(lines)
+
+
+def shard_lines(text: str, workers: int) -> list[list[str]]:
+    """The state list's lines cut into at most `workers` contiguous shards of whole batches ([BATCH] states), in
+    order, as even as whole batches allow; no shard is empty."""
+    lines = text.splitlines(keepends=True)
+    batches = [lines[i:i + BATCH] for i in range(0, len(lines), BATCH)]
+    count = max(1, min(workers, len(batches)))
+    size, extra = divmod(len(batches), count)
+    shards, start = [], 0
+    for i in range(count):
+        end = start + size + (1 if i < extra else 0)
+        shards.append([line for batch in batches[start:end] for line in batch])
+        start = end
+    return shards
+
+
+def merge_indexes(shards: list[Path], out: Path, started_wall: float) -> None:
+    """Writes `out` (`index.json`) from the shard indexes of a parallel run, in shard order: the states concatenated,
+    `seconds` the slowest shard's drawing time, everything else from the first shard."""
+    merged: dict | None = None
+    for path in shards:
+        if not path.is_file() or path.stat().st_mtime < started_wall:
+            raise StatesError(f"shard index {path} missing or older than this run")
+        index = json.loads(path.read_text(encoding="utf-8"))
+        if merged is None:
+            merged = index
+        else:
+            merged["states"].extend(index["states"])
+            merged["seconds"] = max(merged.get("seconds", 0), index.get("seconds", 0))
+    assert merged is not None
+    partial = out.with_name(out.name + ".part")
+    partial.write_text(json.dumps(merged, indent=1) + "\n", encoding="utf-8")
+    partial.replace(out)
 
 
 def check_outputs(out: Path, expected: int, started_wall: float) -> tuple[list[str], dict]:

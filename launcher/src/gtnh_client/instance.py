@@ -22,12 +22,22 @@ class PrepareError(Exception):
 
 @dataclass(frozen=True)
 class Layout:
+    """A client instance: `client_dir` holds the unpacked pack (patches, instance libraries, natives, `.minecraft`),
+    `cache_dir` the shared libraries and assets. `game_dir` replaces `client_dir/.minecraft` for a worker instance
+    (`gtnh_client.workers`) that runs the base client's pack with its own game directory."""
+
     client_dir: Path
     cache_dir: Path
+    game_dir: Path | None = None
 
     @property
     def minecraft_dir(self) -> Path:
-        return self.client_dir / ".minecraft"
+        return self.game_dir or self.client_dir / ".minecraft"
+
+    @property
+    def instance_dir(self) -> Path:
+        """The directory of this instance's own files (`logs-launcher/`): the client dir, or the worker's."""
+        return self.game_dir.parent if self.game_dir else self.client_dir
 
     @property
     def local_libraries(self) -> Path:

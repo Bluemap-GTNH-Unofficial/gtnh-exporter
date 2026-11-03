@@ -568,8 +568,10 @@ class StateCapture(private val mc: Minecraft, private val outDir: File, private 
     }
 
     private fun writeIndex(states: List<State>, seconds: Double) {
-        val file = File(outDir, "index.json")
-        val partial = File(outDir, "index.json.part")
+        // a shard of a parallel run (`gtnh-client states --parallel`) writes its index elsewhere; the launcher merges them
+        val file = System.getProperty("bluemap.gtnh.exporter.statesIndex")?.let(::File) ?: File(outDir, "index.json")
+        file.absoluteFile.parentFile.mkdirs()
+        val partial = File(file.absoluteFile.parentFile, "${file.name}.part")
         JsonWriter(partial.bufferedWriter()).use { out ->
             out.setIndent(" ")
             out.beginObject()

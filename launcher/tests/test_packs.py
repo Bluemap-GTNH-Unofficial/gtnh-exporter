@@ -45,10 +45,11 @@ def test_resolve_pack_follows_flag_then_client_then_default(monkeypatch: pytest.
         cli.resolve_pack(args)
         return args
 
-    args = resolved("cameras", "--scene", "vanilla-zoo")
-    assert (args.gtnh_pack.version, args.server_dir, args.port, args.rcon_port) == ("2.9.0", "gtnh-2.9.0", 25569, 25579)
-    args = resolved("cameras", "--scene", "vanilla-zoo", "--client-dir", str(stable_client))
-    assert (args.gtnh_pack.version, args.server_dir, args.port) == ("2.9.0", "gtnh-2.9.0", 25569)
+    jobs = tmp_path / "jobs.json"
+    args = resolved("cameras", "--jobs", str(jobs))
+    assert (args.gtnh_pack.version, args.jobs, args.parallel) == ("2.9.0", jobs, cli.DEFAULT_PARALLEL)
+    args = resolved("cameras", "--jobs", str(jobs), "--client-dir", str(stable_client))
+    assert args.gtnh_pack.version == "2.9.0"
     args = resolved("coverage", "--pack-version", "2.9.0")
     assert (args.scene, args.world, args.pack) == (
         tmp_path / "out" / "scenes-2.9.0" / "gtnh-zoo", tmp_path / "worlds-2.9.0" / "gtnh-zoo",

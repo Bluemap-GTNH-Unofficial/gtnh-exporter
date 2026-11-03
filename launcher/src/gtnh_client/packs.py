@@ -1,5 +1,5 @@
-"""GTNH pack versions: the instance zip and client directory the launcher prepares, the server the oracle cameras use,
-and where exports, scene outputs and oracle captures go.
+"""GTNH pack versions: the instance zip and client directory the launcher prepares, the scene server whose harness mod
+the oracle cameras load, and where exports, scene outputs and oracle captures go.
 
 Every per-version workspace directory is ``<base><suffix>`` (``out/exporter-2.9.0``, ``worlds-2.9.0``,
 ``out/oracle-2.9.0``, ...), the layout the sibling orchestrator and e2e checkouts use too. Add a version to ``PACKS``
@@ -20,8 +20,6 @@ DEFAULT_VERSION = "2.9.0"
 class Pack:
     version: str
     suffix: str
-    server_port: int  # ports of the scene server (`cameras`)
-    rcon_port: int
 
     def dir(self, ws: Path, base: str) -> Path:
         """``<ws>/<base><suffix>``, e.g. ``out/exporter-2.9.0``."""
@@ -44,7 +42,7 @@ class Pack:
 
 
 PACKS = {
-    "2.9.0": Pack("2.9.0", "-2.9.0", 25569, 25579),
+    "2.9.0": Pack("2.9.0", "-2.9.0"),
 }
 
 

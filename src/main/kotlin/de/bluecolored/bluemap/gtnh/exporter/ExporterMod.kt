@@ -19,7 +19,8 @@ import java.io.File
  *   menu after the resource reload), exports the BlueMap resource pack and quits the game,
  * - `states`: at the same point, renders every listed block state in isolation for the per-state rendering oracle
  *   ([StateCapture]) and quits,
- * - `cameras`: joins a scene server and captures camera views for the world-scene oracle ([CameraCapture]).
+ * - `cameras`: opens scene worlds as single-player saves and captures camera views for the world-scene oracle
+ *   ([CameraCapture]).
  *
  * One-shot modes exit with code 0 on success, 1 if they threw.
  *
@@ -27,6 +28,7 @@ import java.io.File
  * - `bluemap.gtnh.exporter.out`: output directory (default `<game dir>/bluemap-gtnh-export`),
  * - `bluemap.gtnh.exporter.extraStates`: optional file with extra `modid:name meta` lines (e.g. from world scans),
  * - `bluemap.gtnh.exporter.states`: `states` mode: the file of states to render (see [StateCapture]),
+ * - `bluemap.gtnh.exporter.statesIndex`: `states` mode: where to write `index.json` (default: in the output directory),
  * - `bluemap.gtnh.exporter.stay`: `true` keeps the client running after the export (debugging).
  */
 @Mod(
