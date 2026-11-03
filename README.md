@@ -12,10 +12,12 @@ folders) next to it.
 Modded blocks in 1.7.10 are drawn by code, not by resource-pack models, so BlueMap cannot render them on its own. This
 repository holds a one-shot **client** mod that asks the running GTNH client how every modded block looks and writes
 the answer as a BlueMap resource pack, plus `launcher/`, the `gtnh-client` command that prepares a client copy and runs
-the export unattended. The exported pack contains textures of the pack's mods, which belong to their authors. A
-ready pack for 2.9.0 (the base pack plus the five supported community addons) is attached to the
-[umbrella releases](https://github.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH/releases) for convenience, offered
-non-commercially, and removed on request
+the export unattended. The exported pack contains textures of the pack's mods, which belong to their authors. Two
+ready packs for 2.9.0 are attached to the
+[umbrella releases](https://github.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH/releases) for convenience: the base pack
+(`bluemap-gtnh-resources-2.9.0.zip`) for plain 2.9.0 servers and the addon pack
+(`bluemap-gtnh-resources-2.9.0-addons.zip`) for servers running the five supported community addons. They are
+offered non-commercially and removed on request
 ([takedown](https://github.com/Bluemap-GTNH-Unofficial/BlueMap-GTNH/issues/new?template=takedown.yml)). Export your
 own pack if your modlist differs.
 
