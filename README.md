@@ -16,7 +16,8 @@ the export unattended. The exported pack contains textures of the pack's mods: u
 redistribute it.
 
 The mod (`bluemap-gtnh-exporter`) is a Forge 1.7.10 client mod (Kotlin, GTNHGradle `modern` = Java 25 bytecode, package
-`de.bluecolored.bluemap.gtnh.exporter`, modid `bluemapgtnhexporter`) for GT New Horizons 2.9.0-RC-2. Once the
+`de.bluecolored.bluemap.gtnh.exporter`, modid `bluemapgtnhexporter`) for GT New Horizons 2.9.0 (2.9.0-RC-2 is tested
+too; the same jar runs on both). Once the
 client has loaded (20 client ticks after the first screen opens, i.e. the main menu), it exports the appearance of
 every registered non-`minecraft` block into a BlueMap resource pack, then quits the game (exit 0; exit 1 if the
 export threw). Vanilla blocks are rendered from the 1.13 client jar and are not exported.
@@ -28,15 +29,19 @@ of the BlueMap fork (`./gradlew :gtnh-render:test :gtnh-render:addonJar` in `Blu
 
 ```sh
 cd gtnh-exporter/launcher
-uv run gtnh-client export --clean --extra-states-dump ../../out/scenes/gtnh-zoo/dump.ndjson
+uv run gtnh-client export --clean --extra-states-dump ../../out/scenes-2.9.0/gtnh-zoo/dump.ndjson
 ```
 
-builds this mod with Gradle, unpacks a fresh client into `WS/clients/gtnh-2.9.0-RC-2` from the Prism zip, fetches
+builds this mod with Gradle, unpacks a fresh client into `WS/clients/gtnh-2.9.0` from the Prism zip, fetches
 the Mojang/Forge/LWJGL3 libraries and assets (cache `WS/downloads/mc-cache`), starts the client minimized with plain
-`java` (see `launcher/README.md`), and checks the outputs in `WS/out/exporter/`:
+`java` (see `launcher/README.md`), and checks the outputs in `WS/out/exporter-2.9.0/`:
 
-- `bluemap-gtnh-resources-2.9.0-RC-2.zip` — drop into BlueMap's `packs/` (with the `gtnh-render` and `legacy` addons),
+- `bluemap-gtnh-resources-2.9.0.zip` — drop into BlueMap's `packs/` (with the `gtnh-render` and `legacy` addons),
 - `export-report.json` — per-mod counts (also inside the zip as `gtnh/export-report.json`).
+
+For 2.9.0-RC-2 add `--pack-version 2.9.0-RC-2` (client `WS/clients/gtnh-2.9.0-RC-2`, output `WS/out/exporter/`,
+scene dumps in `WS/out/scenes/`): per-version workspace directories end in `-<version>`, and 2.9.0-RC-2, the first
+version tested, keeps the unversioned ones.
 
 Build alone: `mise exec java@temurin-25.0.5+8.0.LTS -- ./gradlew -Porg.gradle.java.installations.paths=$(mise where java@zulu-8.98.0.107)/Contents/Home,$(mise where java@temurin-25.0.5+8.0.LTS)/Contents/Home build`
 (Kotlin Gradle plugin forced to 2.3.21 in `settings.gradle.kts`). The resource-key normalization
@@ -46,7 +51,10 @@ checkout `WS/BlueMap`; the build fails if it is missing), so mapper and exporter
 System properties (the launcher sets them): `bluemap.gtnh.exporter.out` (output dir), `bluemap.gtnh.exporter.extraStates`
 (file of `<modid:name> <meta>` lines, e.g. from world scans; the meta is the last token), `bluemap.gtnh.exporter.stay=true`
 (keep the client open), `bluemap.gtnh.exporter.skipBlocks=true` (GregTech dump only), `bluemap.gtnh.exporter.packSuffix=<s>`
-(output `bluemap-gtnh-resources-2.9.0-RC-2-<s>.zip`).
+(output `bluemap-gtnh-resources-<version>-<s>.zip`), `bluemap.gtnh.exporter.packVersion=<v>` (the `<version>` in the
+pack name and `export-report.json`; default: the version the pack reports itself, `S:ModPackVersion` in
+`config/GTNewHorizons/dreamcraft.cfg`, so a 2.9.0 client writes `bluemap-gtnh-resources-2.9.0.zip`; the export fails
+if neither is set).
 
 Modes (`bluemap.gtnh.exporter.mode`): `export` (default, everything in this README except the oracle sections),
 `states` (renders every listed block state in isolation for the per-state rendering oracle, `oracle/StateCapture.kt`;
@@ -60,13 +68,13 @@ enables the packs (first = highest priority) and mods for that run only; `mods/`
 restored afterwards. Example: `--resource-pack ../../downloads/modernity/Modernity-2.9.x-fa35a3d.zip --extra-mod
 ../../downloads/modernity/MyCTMLib-1.4.3-29x.jar --pack-suffix modernity --out ../../out/modernity`.
 
-Community addons (TST, GTNL, PH, 123T, NHU, Box++; jars and hashes in `WS/downloads/addons/versions.json`): a separate
-client `WS/clients/gtnh-addons` (`prepare --client-dir`), whose `config/GregTech/GregTech.cfg` has
-`crashOnNullRecipeInput=false` and whose addon configs are copied from `WS/servers/gtnh-addons/config` (GTNL
-`enableRecipeOutputChance=false`; see the orchestrator README), then
-`export --client-dir WS/clients/gtnh-addons --out WS/out/exporter-addons --pack-suffix addons --extra-mod <jar>...`
-with `--extra-states-dump` of `gtnh-zoo`, `addons-zoo`, `addons-machines` and `addons-multiblocks`. The GT dump then
-holds every addon MTE and the addon casing texture pages (31, 114, 115, 116) with no exporter change.
+Community addons (jars and hashes in `WS/downloads/addons/versions.json`: TST, GTNL with GTNLLib, PH, NHU, Box++): a
+separate client `WS/clients/gtnh-addons-2.9.0` (`prepare --client-dir`), whose `config/GregTech/GregTech.cfg` has
+`crashOnNullRecipeInput=false` (see the orchestrator README), then
+`export --client-dir WS/clients/gtnh-addons-2.9.0 --out WS/out/exporter-addons-2.9.0 --pack-suffix addons --extra-mod <jar>...`
+with `--extra-states-dump` of `gtnh-zoo`, `addons-zoo`, `addons-machines` and `addons-multiblocks`
+(`WS/out/scenes-2.9.0/<scene>/dump.ndjson`). The GT dump then holds every addon MTE and the addon casing texture pages
+(31, 114, 115, 116) with no exporter change.
 
 Placeholder icons (`missingno`, Forge `MISSING_ICON_BLOCK_*`, Angelica `error_block_*`, which Angelica returns instead of
 null icons) count as missing: probed metas with only placeholders are dropped, cubes need real icons, and a capture that
@@ -134,11 +142,12 @@ bounds, icons per side, render color, tint, tile entity class, result (`cube`/`q
 ## Coverage and screenshots
 
 ```sh
-uv run gtnh-client coverage      # builds :cli:shadowJar :legacy:addonJar :gtnh-render:addonJar, renders WS/worlds/gtnh-zoo
-uv run gtnh-client screens       # serves that render on 127.0.0.1:8210, Playwright/Chromium screenshots -> WS/out/exporter/screens
+uv run gtnh-client coverage      # builds :cli:shadowJar :legacy:addonJar :gtnh-render:addonJar, renders WS/worlds-2.9.0/gtnh-zoo
+uv run gtnh-client screens       # serves that render on 127.0.0.1:8210, Playwright/Chromium screenshots -> WS/out/exporter-2.9.0/screens
 ```
 
-`coverage` writes a CLI config to `WS/out/exporter/coverage/config` (map with `loader: "gtnh:anvil_1_7"`, render mask =
+`coverage` writes a CLI config to `WS/out/exporter-2.9.0/coverage/config` (2.9.0-RC-2, `--pack-version 2.9.0-RC-2`:
+`WS/worlds/` and `WS/out/exporter/`; map with `loader: "gtnh:anvil_1_7"`, render mask =
 the scene's dump box, packs = both addons + the zip), force-renders with `-Dbluemap.gtnh.coverageReport=<file>`
 (`gtnh-render` `CoverageReport`: every distinct state BlueMap computes properties for is classified `ok` / `fallback` (no
 matching variant, first variant drawn) / `no_blockstate` / `no_variant` / `missing_model`), then compares with the scene's

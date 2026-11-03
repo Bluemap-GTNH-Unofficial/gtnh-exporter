@@ -1,6 +1,6 @@
 # gtnh-client
 
-Launches the GT New Horizons 2.9.0-RC-2 **client** (Minecraft 1.7.10, lwjgl3ify, Java 25) on macOS arm64
+Launches the GT New Horizons 2.9.0 or 2.9.0-RC-2 **client** (Minecraft 1.7.10, lwjgl3ify, Java 25) on macOS arm64
 without Prism Launcher, using plain `java` from `mise exec java@temurin-25.0.5+8.0.LTS`. It also drives
 the one-shot BlueMap resource export pipeline with the `bluemap-gtnh-exporter` client mod.
 
@@ -19,10 +19,21 @@ uv run pytest
 
 ## Commands
 
-### `prepare [--zip PATH] [--client-dir DIR] [--clean]`
+Every subcommand takes `--pack-version {2.9.0,2.9.0-RC-2}`: the GTNH pack version of the default zip, client
+directory, server and output paths. Without it the launcher uses the version the `--client-dir` reports itself
+(`S:ModPackVersion` in `.minecraft/config/GTNewHorizons/dreamcraft.cfg`), else `$BMGTNH_PACK_VERSION`, else `2.9.0`;
+a `--pack-version` that differs from the client's own version is an error. Per-version workspace directories end in
+`-<version>` (`WS/out/exporter-2.9.0`, `WS/worlds-2.9.0`, `WS/out/oracle-2.9.0`); 2.9.0-RC-2, the first version
+tested, keeps the unversioned ones (`WS/out/exporter`, `WS/worlds`, `WS/out/oracle`). Below, `<V>` is the pack
+version and `[-<V>]` that suffix (`-2.9.0` on 2.9.0, nothing on 2.9.0-RC-2).
 
-- `--zip` Prism instance zip, default `WS/downloads/GT_New_Horizons_2.9.0-RC-2_Java_17-26.zip`.
-- `--client-dir` default `WS/clients/gtnh-2.9.0-RC-2`.
+### `prepare [--pack-version V] [--zip PATH] [--client-dir DIR] [--clean]`
+
+- `--zip` Prism instance zip, default `WS/downloads/GT_New_Horizons_<V>_Java_17-26.zip`
+  ([2.9.0](https://downloads.gtnewhorizons.com/Multi_mc_downloads/GT_New_Horizons_2.9.0_Java_17-26.zip),
+  [2.9.0-RC-2](https://downloads.gtnewhorizons.com/Multi_mc_downloads/betas/GT_New_Horizons_2.9.0-RC-2_Java_17-26.zip);
+  sha256 in `WS/downloads/gtnh-packs.json`).
+- `--client-dir` default `WS/clients/gtnh-<V>` (`WS/clients/gtnh-2.9.0`, `WS/clients/gtnh-2.9.0-RC-2`).
 - `--clean` deletes the client directory first.
 
 Unpacks the zip with its top folder flattened (`DIR/.minecraft`, `DIR/patches`, `DIR/libraries`,
@@ -87,8 +98,8 @@ client's GL loop is throttled so hard that Forge's login handshake times out eve
      - assetsDir: the cache's `assets/`
      - assetIndex: `1.7.10`
    - `-XstartOnFirstThread` comes from the `FirstThreadOnMacOS` trait.
-   - The local library `com.github.GTNewHorizons:lwjgl3ify:3.0.37:forgePatches` (MMC-hint `local`) is
-     taken from `DIR/libraries/`.
+   - The local library `com.github.GTNewHorizons:lwjgl3ify:<version>:forgePatches` (MMC-hint `local`; 3.0.42 on
+     2.9.0, 3.0.37 on 2.9.0-RC-2) is taken from `DIR/libraries/`.
 
 stdout and stderr are merged and streamed to the console and to `--log`. The default log is
 `DIR/logs-launcher/client-<YYYYmmdd-HHMMSS>.log`, starting with the cwd and the full command line.
@@ -98,7 +109,7 @@ Ctrl-C kills the group the same way and exits with 130; SIGTERM / SIGHUP to the 
 
 Values that start with `-` work as `--jvm-arg -Dfoo=bar` as well as `--jvm-arg=-Dfoo=bar`.
 
-### `export [--client-dir DIR] [--clean] [--mod-jar JAR] [--out WS/out/exporter] [--extra-states FILE]`
+### `export [--pack-version V] [--client-dir DIR] [--clean] [--mod-jar JAR] [--out WS/out/exporter[-<V>]] [--extra-states FILE]`
 
 1. Without `--mod-jar`, it builds the mod in `WS/gtnh-exporter` with
    `mise exec java@temurin-25.0.5+8.0.LTS -- ./gradlew -Porg.gradle.java.installations.paths=$(mise where java@zulu-8.98.0.107)/Contents/Home,$(mise where java@temurin-25.0.5+8.0.LTS)/Contents/Home build`.
@@ -107,23 +118,26 @@ Values that start with `-` work as `--jvm-arg -Dfoo=bar` as well as `--jvm-arg=-
 3. Runs the client with defaults (`--xmx 10G --timeout 1800`) plus the mod and
    `-Dbluemap.gtnh.exporter.out=<abs out>`. With `--extra-states`, it also passes
    `-Dbluemap.gtnh.exporter.extraStates=<abs file>`. The mod shuts the client down when it is done.
-4. On exit code 0, it requires `<out>/export-report.json` and
-   `<out>/bluemap-gtnh-resources-2.9.0-RC-2.zip` to exist and to be newer than the export start.
+4. On exit code 0, it requires `<out>/export-report.json` and `<out>/bluemap-gtnh-resources-<version>.zip` to exist
+   and to be newer than the export start; `<version>` is the client's own `ModPackVersion` (the name the mod
+   writes), else the pack version.
    It then prints the total wall time with the build/prepare/run split. Every failure exits non-zero.
 
-### `cameras --scene NAME [--variant default] [--cameras FILE] [--out DIR] [--client-dir DIR] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--server-dir gtnh-2.9.0-RC-2] [--port 25565] [--rcon-port 25575] [--running-server] [--connect-delay 2] [--xmx 10G] [--timeout 3600] [--log FILE]`
+### `cameras --scene NAME [--pack-version V] [--variant default] [--cameras FILE] [--out DIR] [--client-dir DIR] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--server-dir gtnh-<V>] [--port 25569] [--rcon-port 25579] [--running-server] [--connect-delay 2] [--xmx 10G] [--timeout 3600] [--log FILE]`
+
+The server defaults follow the pack version: `gtnh-2.9.0` on 25569 / 25579, `gtnh-2.9.0-RC-2` on 25565 / 25575.
 
 Reference screenshots of a scene world for the world-scene oracle. `uv run e2e oracle world` (sibling `e2e/`
 checkout) writes the camera list and runs this command with the variant's flags; it also works on its own once
 `cameras.json` exists.
 
-1. Reads the camera list, default `WS/out/oracle/<variant>/worlds/<scene>/cameras.json` (`--variant` only picks the
+1. Reads the camera list, default `WS/out/oracle[-<V>]/<variant>/worlds/<scene>/cameras.json` (`--variant` only picks the
    default paths): `{"format": 1, "scene", "world", "box", "cameras": [{"name", "eye": [x, y, z], "yaw", "pitch",
    "fov", "width", "height"}]}` with Minecraft angles in degrees (yaw 0 = south, 90 = west; pitch 90 = down) and the
    vertical FOV. `box` is the scene's dump box; its chunks must be loaded before a camera is captured.
 2. Builds the exporter mod unless `--mod-jar`, and writes `spec.json` into the output directory: the cameras, RCON
    access (host, port, path of the server's `.rcon-password`), the server's `view-distance` and the settle settings.
-3. Unless `--running-server`: copies `WS/worlds/<world>` into the level folder `oracle-<scene>` of
+3. Unless `--running-server`: copies `WS/worlds[-<V>]/<world>` into the level folder `oracle-<scene>` of
    `WS/servers/<server-dir>` and starts the server, both with the sibling orchestrator (`uv run orch --level
    oracle-<scene> ... restore <world>`, `... start`). It refuses to run if that server is already running. Then turns
    random ticks off on the server (`orch bmh random-ticks off`, needs the harness with that command): the scene stays
@@ -153,35 +167,36 @@ lighting with a white lightmap (full brightness; vanilla's face shade 1.0 up, 0.
 west/east stays); fog pushed beyond the far plane; FOV exactly the camera's (the flying FOV boost cancelled); block
 atlas animations pinned to their first frame.
 
-Outputs (`--out`, default `WS/out/oracle/<variant>/worlds/<scene>/client/`): `<view>.png`; `<view>.depth.bin`
+Outputs (`--out`, default `WS/out/oracle[-<V>]/<variant>/worlds/<scene>/client/`): `<view>.png`; `<view>.depth.bin`
 (float32 little endian, rows top to bottom, OpenGL window depth 0..1, 1 = nothing drawn); `<view>.json` with the
 projection and modelview matrices (column-major, read at `RenderWorldLastEvent`; world to eye is
 `modelview * translate(-camera)`), the camera position, the settle and stability record and timings;
 `cameras-report.json`; `spec.json`.
 
-### `states [--variant default] [--out DIR] [--states-from PACK] [--only REGEX] [--client-dir DIR] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--xmx 10G] [--timeout 3600] [--log FILE]`
+### `states [--pack-version V] [--variant default] [--out DIR] [--states-from PACK] [--only REGEX] [--client-dir DIR] [--resource-pack PACK ...] [--extra-mod JAR ...] [--mod-jar JAR] [--xmx 10G] [--timeout 3600] [--log FILE]`
 
 Reference renders of every block state for the per-state rendering oracle (`uv run e2e oracle states` in the
 sibling `e2e/` checkout compares them with BlueMap; the e2e README has the whole procedure).
 
 1. Builds the exporter mod unless `--mod-jar`; prepares the client directory if it does not exist.
-2. Writes the state list `WS/out/oracle/<variant>/states/states.txt` (`<modid:name> <meta>` lines): the vanilla
+2. Writes the state list `WS/out/oracle[-<V>]/<variant>/states/states.txt` (`<modid:name> <meta>` lines): the vanilla
    states that Mojang's 1.13 flattening table knows (`registered = 1` in the BlueMap fork's
    `legacy/.../flattening_1_7_10.tsv`, air excluded), then every state of the exported pack's `gtnh/blocks.ndjson`
-   (`--states-from`, default `WS/out/exporter/bluemap-gtnh-resources-2.9.0-RC-2.zip`: the exporter's own state
+   (`--states-from`, default `WS/out/exporter[-<V>]/bluemap-gtnh-resources-<V>.zip`: the exporter's own state
    discovery, whatever the export result). `--only` keeps the states whose `<modid:name> <meta>` matches and writes
    `states-only.txt` instead; without it the output directory is emptied first.
 3. Runs the client (`--resource-pack` and `--extra-mod` installed for this run only, as with `export`) with
    `-Dbluemap.gtnh.exporter.mode=states`, `-Dbluemap.gtnh.exporter.states=<list>` and
-   `-Dbluemap.gtnh.exporter.out=<out>` (default `WS/out/oracle/<variant>/states/client/`). The mod draws the states
+   `-Dbluemap.gtnh.exporter.out=<out>` (default `WS/out/oracle[-<V>]/<variant>/states/client/`). The mod draws the states
    at the main menu and quits (see the exporter README, "Per-state oracle").
 4. Requires `<out>/index.json` newer than the run with one entry and one image per listed state; prints the
    counts of states with render errors, blank states and states with a tile-entity special renderer.
 
-Variants: `default` as above; `modernity` with `--client-dir WS/clients/gtnh-modernity --resource-pack
+Variants: `default` as above; `modernity` with `--client-dir WS/clients/gtnh-modernity[-<V>] --resource-pack
 WS/downloads/modernity/Modernity-2.9.x-<sha>.zip --extra-mod WS/downloads/modernity/MyCTMLib-<v>-29x.jar --variant
-modernity`; `addons` with `--client-dir WS/clients/gtnh-addons --states-from WS/out/exporter-addons/<addons zip>
---extra-mod <addon jar>... --variant addons`. 62,770 states take about 65 s (33 s drawing).
+modernity`; `addons` with `--client-dir WS/clients/gtnh-addons[-<V>] --states-from
+WS/out/exporter-addons[-<V>]/<addons zip> --extra-mod <addon jar>... --variant addons` (`[-<V>]`: `-2.9.0` on 2.9.0,
+nothing on 2.9.0-RC-2). On 2.9.0-RC-2, 62,770 states take about 65 s (33 s drawing).
 
 ## Layout
 
@@ -190,9 +205,9 @@ WS/downloads/mc-cache/                 shared cache, survives `--clean`
   libraries/<maven path>               all remote libraries + com/mojang/minecraft/1.7.10/minecraft-1.7.10-client.jar
   assets/indexes/1.7.10.json
   assets/objects/<hh>/<hash>
-WS/clients/gtnh-2.9.0-RC-2/            client dir (unpacked instance)
+WS/clients/gtnh-2.9.0/                 client dir (unpacked instance; 2.9.0-RC-2: WS/clients/gtnh-2.9.0-RC-2/)
   .minecraft/                          game dir (mods, config, logs, saves)
-  libraries/lwjgl3ify-3.0.37-forgePatches.jar
+  libraries/lwjgl3ify-3.0.42-forgePatches.jar   (2.9.0-RC-2: lwjgl3ify-3.0.37-forgePatches.jar)
   patches/*.json, mmc-pack.json
   natives/                             extracted native libs (jinput)
   logs-launcher/client-*.log
@@ -202,7 +217,7 @@ WS/clients/gtnh-2.9.0-RC-2/            client dir (unpacked instance)
 Downloads are written to a `.part` file, checked against SHA-1 and size, and renamed into place. 16
 downloads run in parallel. `prepare` re-hashes cached files, which takes about 0.1 s for all of them.
 
-## Measured timings (MacBook arm64, 18 cores, 64 GB)
+## Measured timings (MacBook arm64, 18 cores, 64 GB, GTNH 2.9.0-RC-2)
 
 | Step | Time |
 |---|---|
@@ -214,7 +229,7 @@ downloads run in parallel. `prepare` re-hashes cached files, which takes about 0
 
 Boot milestones in the log:
 
-- `[FML]: Forge Mod Loader has successfully loaded 322 mods` marks the end of mod loading.
+- `[FML]: Forge Mod Loader has successfully loaded 322 mods` (on 2.9.0-RC-2) marks the end of mod loading.
 - `[ArchaicFix]: The game loaded in N seconds.` / `[Angelica]: The game loaded in N seconds.` mark
   the main menu. They come right after `[betterloadingscreen]: BLS Splash loading thread closing`.
 

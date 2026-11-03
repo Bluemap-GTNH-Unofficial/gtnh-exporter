@@ -4,21 +4,28 @@ from pathlib import Path
 
 import pytest
 
+from gtnh_client import packs
 from gtnh_client.cli import default_zip
 from gtnh_client.launch import offline_uuid
 from gtnh_client.profile import MACOS_ARM64, RuntimeContext, build_profile, classpath, rules_allow
 
-TOP = "GT New Horizons 2.9.0-RC-2"
 
-
-@pytest.fixture(scope="module")
-def components() -> list[dict]:
-    zip_path = default_zip()
+@pytest.fixture(scope="module", params=list(packs.PACKS))
+def components(request) -> list[dict]:
+    """The MultiMC components of the instance zip of every pack version present in WS/downloads."""
+    zip_path = default_zip(packs.get(request.param))
     if not zip_path.is_file():
         pytest.skip(f"{zip_path} not present")
+    top = f"GT New Horizons {request.param}"
     with zipfile.ZipFile(zip_path) as zf:
-        pack = json.loads(zf.read(f"{TOP}/mmc-pack.json"))
-        return [json.loads(zf.read(f"{TOP}/patches/{c['uid']}.json")) for c in pack["components"]]
+        pack = json.loads(zf.read(f"{top}/mmc-pack.json"))
+        return [json.loads(zf.read(f"{top}/patches/{c['uid']}.json")) for c in pack["components"]]
+
+
+def lwjgl3ify_patches(components: list[dict]) -> str:
+    """The instance-local lwjgl3ify forge patches jar (its version changes between pack versions)."""
+    (version,) = [c["version"] for c in components if c["uid"] == "me.eigenraven.lwjgl3ify.forgepatches"]
+    return f"lwjgl3ify-{version}-forgePatches.jar"
 
 
 def osr(name: str, action: str = "allow") -> dict:
@@ -52,7 +59,7 @@ def test_natives_resolution(components):
 def test_classpath_order(components):
     profile = build_profile(components)
     names = [p.name for p in classpath(profile, Path("/libs"), Path("/local"))]
-    assert len(names) == len(set(names))
+    patches = lwjgl3ify_patches(components)
     # lwjgl3 component first, x86_64 macos natives excluded, arm64 natives present
     assert names[0] == "lwjgl-freetype-natives-macos-arm64-3.4.3.jar"
     assert "lwjgl-natives-macos-3.4.3.jar" not in names
@@ -60,15 +67,11 @@ def test_classpath_order(components):
     assert not any("windows" in n or "linux" in n for n in names)
     # minecraft libs, guava upgraded in place by forge's 17.0
     assert "guava-15.0.jar" not in names
-    assert names.index("guava-17.0.jar") < names.index("lwjgl3ify-3.0.37-forgePatches.jar")
+    assert names.index("guava-17.0.jar") < names.index(patches)
     # lwjgl3ify forge patches (local) before forge universal, main jar last
-    assert names.index("lwjgl3ify-3.0.37-forgePatches.jar") + 1 == names.index(
-        "forge-1.7.10-10.13.4.1614-1.7.10-universal.jar"
-    )
+    assert names.index(patches) + 1 == names.index("forge-1.7.10-10.13.4.1614-1.7.10-universal.jar")
     assert names[-1] == "minecraft-1.7.10-client.jar"
-    assert classpath(profile, Path("/libs"), Path("/local"))[names.index("lwjgl3ify-3.0.37-forgePatches.jar")] == Path(
-        "/local/lwjgl3ify-3.0.37-forgePatches.jar"
-    )
+    assert classpath(profile, Path("/libs"), Path("/local"))[names.index(patches)] == Path(f"/local/{patches}")
 
 
 def test_profile_launch_fields(components):

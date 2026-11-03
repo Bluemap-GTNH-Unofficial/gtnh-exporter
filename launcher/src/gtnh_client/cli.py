@@ -13,7 +13,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from gtnh_client import cameras, coverage, states
+from gtnh_client import cameras, coverage, packs, states
 from gtnh_client.proxy import DelayProxy
 from gtnh_client.download import DownloadError
 from gtnh_client.instance import Layout, PrepareError, ensure_downloads, prepare
@@ -32,10 +32,8 @@ from gtnh_client.launch import (
 )
 from gtnh_client.profile import ProfileError
 
-PACK_VERSION = "2.9.0-RC-2"
 ZULU8_TOOL = "java@zulu-8.98.0.107"
 EXPORTER_MOD_GLOB = "bluemap-gtnh-exporter-*.jar"
-RESOURCES_ZIP = f"bluemap-gtnh-resources-{PACK_VERSION}.zip"
 EXPORT_REPORT = "export-report.json"
 
 
@@ -63,12 +61,12 @@ def exporter_repo() -> Path:
     return EXPORTER_REPO
 
 
-def default_zip() -> Path:
-    return workspace() / "downloads" / f"GT_New_Horizons_{PACK_VERSION}_Java_17-26.zip"
+def default_zip(pack: packs.Pack) -> Path:
+    return workspace() / "downloads" / pack.zip_name
 
 
-def default_client_dir() -> Path:
-    return workspace() / "clients" / f"gtnh-{PACK_VERSION}"
+def default_client_dir(pack: packs.Pack) -> Path:
+    return workspace() / "clients" / pack.client
 
 
 def bluemap_repo() -> Path:
@@ -79,13 +77,14 @@ def bluemap_repo() -> Path:
     return root
 
 
-def make_layout(client_dir: Path | None) -> Layout:
-    return Layout((client_dir or default_client_dir()).resolve(), (workspace() / "downloads" / "mc-cache").resolve())
+def make_layout(client_dir: Path | None, pack: packs.Pack) -> Layout:
+    return Layout((client_dir or default_client_dir(pack)).resolve(), (workspace() / "downloads" / "mc-cache").resolve())
 
 
 def run_client(
     layout: Layout,
     *,
+    zip_path: Path,
     mods: list[Path],
     jvm_args: list[str],
     xmx: str,
@@ -101,7 +100,7 @@ def run_client(
     `resourcePacks` restored), so later default runs are unaffected. `disable_exporter` parks the exporter mod in
     `.minecraft/mods-disabled/` for the session (it would export and quit) and puts it back afterwards."""
     if not layout.client_dir.exists():
-        prepare(layout, default_zip())
+        prepare(layout, zip_path)
     profile = layout.load_profile()
     ensure_downloads(layout, profile)
     recover_parked_mods(layout.minecraft_dir)
@@ -194,7 +193,7 @@ def build_exporter_mod() -> Path:
 
 
 def cmd_prepare(args: argparse.Namespace) -> int:
-    prepare(make_layout(args.client_dir), args.zip, clean=args.clean)
+    prepare(make_layout(args.client_dir, args.gtnh_pack), args.zip or default_zip(args.gtnh_pack), clean=args.clean)
     return 0
 
 
@@ -212,7 +211,8 @@ def cmd_play(args: argparse.Namespace) -> int:
         game_args = ["--server", host, "--port", port]
     try:
         return run_client(
-            make_layout(args.client_dir),
+            make_layout(args.client_dir, args.gtnh_pack),
+            zip_path=default_zip(args.gtnh_pack),
             mods=[],
             jvm_args=args.jvm_arg,
             xmx=args.xmx,
@@ -229,7 +229,8 @@ def cmd_play(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     return run_client(
-        make_layout(args.client_dir),
+        make_layout(args.client_dir, args.gtnh_pack),
+        zip_path=default_zip(args.gtnh_pack),
         mods=args.mod,
         jvm_args=args.jvm_arg,
         xmx=args.xmx,
@@ -251,15 +252,16 @@ def cmd_export(args: argparse.Namespace) -> int:
             raise CliError(f"--extra-states-dump {dump} does not exist")
     mod_jar = args.mod_jar.resolve() if args.mod_jar else build_exporter_mod()
     t_build = time.monotonic()
-    layout = make_layout(args.client_dir)
-    prepare(layout, default_zip(), clean=args.clean)
+    layout = make_layout(args.client_dir, args.gtnh_pack)
+    prepare(layout, default_zip(args.gtnh_pack), clean=args.clean)
     t_prepare = time.monotonic()
-    out = args.out.resolve()
+    out = (args.out or args.gtnh_pack.dir(workspace(), "out/exporter")).resolve()
     out.mkdir(parents=True, exist_ok=True)
     jvm_args = [f"-Dbluemap.gtnh.exporter.out={out}"]
     if args.pack_suffix:
         jvm_args.append(f"-Dbluemap.gtnh.exporter.packSuffix={args.pack_suffix}")
-    zip_name = RESOURCES_ZIP if not args.pack_suffix else RESOURCES_ZIP.removesuffix(".zip") + f"-{args.pack_suffix}.zip"
+    # the mod names the pack after the version the client reports itself (dreamcraft.cfg), as packs.client_version
+    zip_name = packs.resources_zip(packs.client_version(layout.minecraft_dir) or args.gtnh_pack.version, args.pack_suffix)
     extra_files = [args.extra_states.resolve()] if args.extra_states else []
     if args.extra_states_dump:
         scanned = out / "extra-states.txt"
@@ -272,7 +274,8 @@ def cmd_export(args: argparse.Namespace) -> int:
             merged.write_text("".join(f.read_text() for f in extra_files))
         jvm_args.append(f"-Dbluemap.gtnh.exporter.extraStates={merged}")
     code = run_client(
-        layout, mods=[mod_jar], jvm_args=jvm_args, xmx="10G", timeout=1800, username="BlueMapExporter", log=None,
+        layout, zip_path=default_zip(args.gtnh_pack), mods=[mod_jar], jvm_args=jvm_args, xmx="10G", timeout=1800,
+        username="BlueMapExporter", log=None,
         extra_mods=[p.resolve() for p in args.extra_mod], resource_packs=[p.resolve() for p in args.resource_pack],
     )
     t_run = time.monotonic()
@@ -302,7 +305,7 @@ def cmd_cameras(args: argparse.Namespace) -> int:
     started_wall = time.time()
     t0 = time.monotonic()
     ws = workspace()
-    scene_dir = ws / "out" / "oracle" / args.variant / "worlds" / args.scene
+    scene_dir = args.gtnh_pack.dir(ws, "out/oracle") / args.variant / "worlds" / args.scene
     cameras_file = (args.cameras or scene_dir / "cameras.json").resolve()
     out = (args.out or scene_dir / "client").resolve()
     data = cameras.read_cameras(cameras_file)
@@ -321,13 +324,15 @@ def cmd_cameras(args: argparse.Namespace) -> int:
     if not (orch_checkout / "pyproject.toml").is_file():
         raise CliError(f"orchestrator checkout not found at {orch_checkout}")
     world = data.get("world", args.scene)
-    if not args.running_server and not (ws / "worlds" / world).is_dir():
-        raise CliError(f"scene world {ws / 'worlds' / world} does not exist; build it with `uv run orch scene {args.scene}`")
+    worlds = args.gtnh_pack.dir(ws, "worlds")
+    if not args.running_server and not (worlds / world).is_dir():
+        raise CliError(f"scene world {worlds / world} does not exist; build it with "
+                       f"`uv run orch --pack-version {args.gtnh_pack.version} scene {args.scene}`")  # fmt: skip
 
     mod_jar = args.mod_jar.resolve() if args.mod_jar else build_exporter_mod()
-    layout = make_layout(args.client_dir)
+    layout = make_layout(args.client_dir, args.gtnh_pack)
     if not layout.client_dir.exists():
-        prepare(layout, default_zip())
+        prepare(layout, default_zip(args.gtnh_pack))
     out.mkdir(parents=True, exist_ok=True)
     cameras.clean_outputs(out, data)
     spec = cameras.build_spec(
@@ -336,7 +341,7 @@ def cmd_cameras(args: argparse.Namespace) -> int:
     spec_file = cameras.write_spec(spec, out)
     orch = cameras.Orchestrator(
         orch_checkout, args.server_dir, args.port, args.rcon_port, level=cameras.LEVEL_PREFIX + args.scene,
-        level_type=data.get("levelType", "FLAT"),
+        level_type=data.get("levelType", "FLAT"), pack_version=args.gtnh_pack.version,
     )
     t_build = time.monotonic()
     t_server = t_client = t_build
@@ -368,7 +373,8 @@ def cmd_cameras(args: argparse.Namespace) -> int:
         ]
         with cameras.capture_settings(layout.minecraft_dir):
             code = run_client(
-                layout, mods=[mod_jar], jvm_args=jvm_args, xmx=args.xmx, timeout=args.timeout, username=cameras.USERNAME,
+                layout, zip_path=default_zip(args.gtnh_pack), mods=[mod_jar], jvm_args=jvm_args, xmx=args.xmx,
+                timeout=args.timeout, username=cameras.USERNAME,
                 log=args.log, extra_mods=[p.resolve() for p in args.extra_mod],
                 resource_packs=[p.resolve() for p in args.resource_pack], game_args=["--server", host, "--port", str(port)],
             )
@@ -412,9 +418,9 @@ def cmd_states(args: argparse.Namespace) -> int:
     started_wall = time.time()
     t0 = time.monotonic()
     ws = workspace()
-    variant_dir = ws / "out" / "oracle" / args.variant / "states"
+    variant_dir = args.gtnh_pack.dir(ws, "out/oracle") / args.variant / "states"
     out = (args.out or variant_dir / "client").resolve()
-    pack = (args.states_from or ws / "out" / "exporter" / RESOURCES_ZIP).resolve()
+    pack = (args.states_from or args.gtnh_pack.dir(ws, "out/exporter") / packs.resources_zip(args.gtnh_pack.version)).resolve()
     for path in [pack, *args.resource_pack, *args.extra_mod]:
         if not path.exists():
             raise CliError(f"{path} does not exist")
@@ -423,9 +429,9 @@ def cmd_states(args: argparse.Namespace) -> int:
     flattening = bluemap_repo() / states.FLATTENING_TSV
     mod_jar = args.mod_jar.resolve() if args.mod_jar else build_exporter_mod()
     t_build = time.monotonic()
-    layout = make_layout(args.client_dir)
+    layout = make_layout(args.client_dir, args.gtnh_pack)
     if not layout.client_dir.exists():
-        prepare(layout, default_zip())
+        prepare(layout, default_zip(args.gtnh_pack))
     if out.exists() and not args.only:
         shutil.rmtree(out)  # a full run starts clean: images of states that are no longer listed must not survive
     out.mkdir(parents=True, exist_ok=True)
@@ -440,7 +446,8 @@ def cmd_states(args: argparse.Namespace) -> int:
         f"-Dbluemap.gtnh.exporter.states={states_file}",
     ]
     code = run_client(
-        layout, mods=[mod_jar], jvm_args=jvm_args, xmx=args.xmx, timeout=args.timeout, username="BlueMapExporter",
+        layout, zip_path=default_zip(args.gtnh_pack), mods=[mod_jar], jvm_args=jvm_args, xmx=args.xmx,
+        timeout=args.timeout, username="BlueMapExporter",
         log=args.log, extra_mods=[p.resolve() for p in args.extra_mod],
         resource_packs=[p.resolve() for p in args.resource_pack],
     )
@@ -470,20 +477,28 @@ def _join_dash_values(argv: list[str]) -> list[str]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    ws = workspace()
-    parser = argparse.ArgumentParser(prog="gtnh-client", description=f"Launch the GTNH {PACK_VERSION} client without Prism.")
+    parser = argparse.ArgumentParser(
+        prog="gtnh-client", description=f"Launch a GT New Horizons client without Prism (pack {packs.DEFAULT_VERSION} by default)."
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def client_dir_arg(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--client-dir", type=Path, help=f"client directory (default {default_client_dir()})")
+    def add_parser(name: str, **kwargs) -> argparse.ArgumentParser:
+        p = sub.add_parser(name, **kwargs)
+        p.add_argument("--pack-version", choices=list(packs.PACKS),
+                       help="GTNH pack version of the default zip, client, server and output paths (default: the "
+                            f"--client-dir's own version, else $BMGTNH_PACK_VERSION, else {packs.DEFAULT_VERSION})")
+        return p
 
-    p = sub.add_parser("prepare", help="unpack the instance zip and download libraries/assets")
-    p.add_argument("--zip", type=Path, default=default_zip(), help="Prism instance zip (default %(default)s)")
+    def client_dir_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--client-dir", type=Path, help="client directory (default WS/clients/gtnh-<version>)")
+
+    p = add_parser("prepare", help="unpack the instance zip and download libraries/assets")
+    p.add_argument("--zip", type=Path, help="Prism instance zip (default WS/downloads/GT_New_Horizons_<version>_Java_17-26.zip)")
     client_dir_arg(p)
     p.add_argument("--clean", action="store_true", help="delete the client directory first")
     p.set_defaults(func=cmd_prepare)
 
-    p = sub.add_parser("run", help="launch the client (prepares first if the client directory is missing)")
+    p = add_parser("run", help="launch the client (prepares first if the client directory is missing)")
     client_dir_arg(p)
     p.add_argument("--mod", type=Path, action="append", default=[], help="mod jar to copy into .minecraft/mods (repeatable)")
     p.add_argument("--jvm-arg", action="append", default=[], help="extra JVM argument (repeatable)")
@@ -493,7 +508,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log", type=Path, help="log file (default <client-dir>/logs-launcher/client-<timestamp>.log)")
     p.set_defaults(func=cmd_run)
 
-    p = sub.add_parser("play", help="launch the client without the exporter mod, optionally auto-connecting to a server")
+    p = add_parser("play", help="launch the client without the exporter mod, optionally auto-connecting to a server")
     client_dir_arg(p)
     p.add_argument("--server", help="host[:port] to connect to on start (1.7.10 --server/--port), e.g. 127.0.0.1:25567")
     p.add_argument("--connect-delay", type=float, default=2.0, help="connect through a local proxy that holds the server's first reply this many seconds, working around Forge's login race with fast local servers; 0 = direct (default %(default)s)")
@@ -504,11 +519,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log", type=Path, help="log file (default <client-dir>/logs-launcher/client-<timestamp>.log)")
     p.set_defaults(func=cmd_play)
 
-    p = sub.add_parser("export", help="build the exporter mod, prepare, run it and verify the export outputs")
+    p = add_parser("export", help="build the exporter mod, prepare, run it and verify the export outputs")
     client_dir_arg(p)
     p.add_argument("--clean", action="store_true", help="delete the client directory first")
     p.add_argument("--mod-jar", type=Path, help="use this exporter jar instead of building it with gradle")
-    p.add_argument("--out", type=Path, default=ws / "out" / "exporter", help="export output directory (default %(default)s)")
+    p.add_argument("--out", type=Path, help="export output directory (default WS/out/exporter-<version>)")
     p.add_argument("--extra-states", type=Path, help="extra block states file passed to the exporter ('<modid:name> <meta>' lines)")
     p.add_argument("--extra-states-dump", type=Path, action="append", default=[], help="bmh dump.ndjson (world scan) whose non-vanilla states are exported too; repeatable")
     p.add_argument("--resource-pack", type=Path, action="append", default=[], help="client resource pack (zip or dir) enabled for this export only, first = highest priority; repeatable")
@@ -516,18 +531,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--pack-suffix", help="output pack name suffix: bluemap-gtnh-resources-<version>-<suffix>.zip")
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("cameras", help="reference screenshots of a scene world for the world-scene oracle (e2e oracle world)")
+    p = add_parser("cameras", help="reference screenshots of a scene world for the world-scene oracle (e2e oracle world)")
     client_dir_arg(p)
-    p.add_argument("--scene", required=True, help="scene name (e2e scenes/<scene>.yaml, worlds/<scene>)")
+    p.add_argument("--scene", required=True, help="scene name (e2e scenes/<scene>.yaml, the pack version's worlds/<scene>)")
     p.add_argument("--variant", default="default", help="oracle variant, only for the default paths (default %(default)s)")
-    p.add_argument("--cameras", type=Path, help="camera list (default WS/out/oracle/<variant>/worlds/<scene>/cameras.json, written by `e2e oracle world`)")
-    p.add_argument("--out", type=Path, help="output dir (default WS/out/oracle/<variant>/worlds/<scene>/client)")
+    p.add_argument("--cameras", type=Path, help="camera list (default WS/out/oracle[-<version>]/<variant>/worlds/<scene>/cameras.json, written by `e2e oracle world`)")
+    p.add_argument("--out", type=Path, help="output dir (default WS/out/oracle[-<version>]/<variant>/worlds/<scene>/client)")
     p.add_argument("--resource-pack", type=Path, action="append", default=[], help="client resource pack enabled for this run only, first = highest priority; repeatable")
     p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this run only; repeatable")
     p.add_argument("--mod-jar", type=Path, help="use this exporter jar instead of building it with gradle")
-    p.add_argument("--server-dir", default=f"gtnh-{PACK_VERSION}", help="server directory under WS/servers (default %(default)s)")
-    p.add_argument("--port", type=int, default=25565, help="server port (default %(default)s)")
-    p.add_argument("--rcon-port", type=int, default=25575, help="server RCON port (default %(default)s)")
+    p.add_argument("--server-dir", help="server directory under WS/servers (default gtnh-<version>)")
+    p.add_argument("--port", type=int, help="server port (default: the pack version's, 25569 for 2.9.0)")
+    p.add_argument("--rcon-port", type=int, help="server RCON port (default: the pack version's, 25579 for 2.9.0)")
     p.add_argument("--running-server", action="store_true", help="use the server already running the scene world (no restore/start/stop)")
     p.add_argument("--connect-delay", type=float, default=2.0, help="hold the server's first reply this many seconds (Forge login race, see `play`); 0 = direct (default %(default)s)")
     p.add_argument("--xmx", default="10G", help="client heap size (default %(default)s)")
@@ -535,11 +550,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--log", type=Path, help="client log file (default <client-dir>/logs-launcher/client-<timestamp>.log)")
     p.set_defaults(func=cmd_cameras)
 
-    p = sub.add_parser("states", help="reference renders of every block state for the per-state oracle (e2e oracle states)")
+    p = add_parser("states", help="reference renders of every block state for the per-state oracle (e2e oracle states)")
     client_dir_arg(p)
     p.add_argument("--variant", default="default", help="oracle variant, only for the default paths (default %(default)s)")
-    p.add_argument("--out", type=Path, help="output dir (default WS/out/oracle/<variant>/states/client)")
-    p.add_argument("--states-from", type=Path, help=f"exported pack whose gtnh/blocks.ndjson lists the modded states (default WS/out/exporter/{RESOURCES_ZIP})")
+    p.add_argument("--out", type=Path, help="output dir (default WS/out/oracle[-<version>]/<variant>/states/client)")
+    p.add_argument("--states-from", type=Path, help="exported pack whose gtnh/blocks.ndjson lists the modded states (default: the version's export, WS/out/exporter[-<version>]/bluemap-gtnh-resources-<version>.zip)")
     p.add_argument("--only", help="only states whose '<modid:name> <meta>' matches this regex (keeps the other outputs)")
     p.add_argument("--resource-pack", type=Path, action="append", default=[], help="client resource pack enabled for this run only, first = highest priority; repeatable")
     p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this run only; repeatable")
@@ -550,20 +565,20 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_states)
 
     def coverage_args(p: argparse.ArgumentParser) -> None:
-        p.add_argument("--scene", type=Path, default=ws / "out" / "scenes" / "gtnh-zoo", help="scene output dir with dump.ndjson and scene.json (default %(default)s)")
-        p.add_argument("--world", type=Path, default=ws / "worlds" / "gtnh-zoo", help="world to render (default %(default)s)")
-        p.add_argument("--pack", type=Path, default=ws / "out" / "exporter" / RESOURCES_ZIP, help="exported resource pack (default %(default)s)")
-        p.add_argument("--out", type=Path, default=ws / "out" / "exporter" / "coverage", help="work/output dir (default %(default)s)")
+        p.add_argument("--scene", type=Path, help="scene output dir with dump.ndjson and scene.json (default WS/out/scenes[-<version>]/gtnh-zoo)")
+        p.add_argument("--world", type=Path, help="world to render (default WS/worlds[-<version>]/gtnh-zoo)")
+        p.add_argument("--pack", type=Path, help="exported resource pack (default WS/out/exporter[-<version>]/bluemap-gtnh-resources-<version>.zip)")
+        p.add_argument("--out", type=Path, help="work/output dir (default WS/out/exporter[-<version>]/coverage)")
         p.add_argument("--no-build", action="store_true", help="use the existing CLI/addon jars instead of building them")
         p.add_argument("--port", type=int, default=8210, help="CLI webserver port (default %(default)s)")
 
-    p = sub.add_parser("coverage", help="render a scene world with the BlueMap CLI and compare rendered states with its dump")
+    p = add_parser("coverage", help="render a scene world with the BlueMap CLI and compare rendered states with its dump")
     coverage_args(p)
     p.set_defaults(func=cmd_coverage)
 
-    p = sub.add_parser("screens", help="serve the coverage render and take headless Chromium screenshots")
+    p = add_parser("screens", help="serve the coverage render and take headless Chromium screenshots")
     coverage_args(p)
-    p.add_argument("--shots", type=Path, default=ws / "out" / "exporter" / "screens", help="screenshot dir (default %(default)s)")
+    p.add_argument("--shots", type=Path, help="screenshot dir (default WS/out/exporter[-<version>]/screens)")
     p.add_argument("--view", action="append", default=[], metavar="NAME=HASH", help="view as name=<webapp url hash>; repeatable (default: a few zoo overviews)")
     p.set_defaults(func=cmd_screens)
     return parser
@@ -674,9 +689,37 @@ def cmd_screens(args: argparse.Namespace) -> int:
             server.kill()
 
 
+def resolve_pack(args: argparse.Namespace) -> None:
+    """Sets ``args.gtnh_pack`` and the defaults that depend on it. The pack version is ``--pack-version``, else the
+    version the ``--client-dir`` reports itself (packs.client_version), else $BMGTNH_PACK_VERSION, else the default."""
+    client_dir = getattr(args, "client_dir", None)
+    own = packs.client_version(client_dir / ".minecraft") if client_dir else None
+    if args.pack_version and own and own != args.pack_version:
+        raise CliError(f"{client_dir} is a GTNH {own} client, not --pack-version {args.pack_version}")
+    try:
+        pack = packs.get(args.pack_version or (own if own in packs.PACKS else None))
+    except ValueError as e:
+        raise CliError(str(e)) from e
+    args.gtnh_pack = pack
+    ws = workspace()
+    if args.command == "cameras":
+        args.server_dir = args.server_dir or pack.server
+        args.port = args.port or pack.server_port
+        args.rcon_port = args.rcon_port or pack.rcon_port
+    if args.command in ("coverage", "screens"):
+        exporter = pack.dir(ws, "out/exporter")
+        args.scene = args.scene or pack.dir(ws, "out/scenes") / "gtnh-zoo"
+        args.world = args.world or pack.dir(ws, "worlds") / "gtnh-zoo"
+        args.pack = args.pack or exporter / packs.resources_zip(pack.version)
+        args.out = args.out or exporter / "coverage"
+        if args.command == "screens":
+            args.shots = args.shots or exporter / "screens"
+
+
 def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(_join_dash_values(sys.argv[1:] if argv is None else argv))
     try:
+        resolve_pack(args)
         sys.exit(args.func(args))
     except (CliError, cameras.CamerasError, states.StatesError, PrepareError, ProfileError, DownloadError,
             FileNotFoundError, subprocess.CalledProcessError) as e:  # fmt: skip

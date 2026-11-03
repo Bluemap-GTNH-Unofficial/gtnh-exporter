@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from gtnh_client import cameras
-from gtnh_client.cli import build_parser
+from gtnh_client.cli import build_parser, resolve_pack
 
 CAMERAS = {
     "format": 1,
@@ -104,10 +104,13 @@ def test_outputs_are_cleaned_and_checked(tmp_path: Path):
     assert cameras.check_outputs(tmp_path, CAMERAS, started) == [f"{tmp_path / 'south.png'} missing or stale"]
 
 
-def test_cameras_parser():
+def test_cameras_parser(monkeypatch):
+    monkeypatch.delenv("BMGTNH_PACK_VERSION", raising=False)
     args = build_parser().parse_args(
         ["cameras", "--scene", "gt-pipes", "--resource-pack", "a.zip", "--extra-mod", "b.jar", "--port", "25568"]
     )
+    resolve_pack(args)
     assert args.scene == "gt-pipes" and args.variant == "default"
     assert args.resource_pack == [Path("a.zip")] and args.extra_mod == [Path("b.jar")]
-    assert args.port == 25568 and args.rcon_port == 25575 and not args.running_server
+    # --port given, the RCON port and server directory follow the default pack version
+    assert args.port == 25568 and args.rcon_port == 25579 and args.server_dir == "gtnh-2.9.0" and not args.running_server

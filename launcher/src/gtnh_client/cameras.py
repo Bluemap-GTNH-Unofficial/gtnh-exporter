@@ -153,7 +153,8 @@ def capture_settings(minecraft_dir: Path):
 
 @dataclass
 class Orchestrator:
-    """The sibling `orchestrator` checkout's `orch` command (run with uv) for one server directory and level."""
+    """The sibling `orchestrator` checkout's `orch` command (run with uv) for one server directory, level and pack
+    version (whose world snapshots `restore` reads)."""
 
     checkout: Path
     server: str
@@ -161,10 +162,12 @@ class Orchestrator:
     rcon_port: int
     level: str
     level_type: str = "FLAT"
+    pack_version: str | None = None
 
     def run(self, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-        cmd = ["uv", "run", "orch", "--server", self.server, "--port", str(self.port), "--rcon-port", str(self.rcon_port),
-               "--level", self.level, "--level-type", self.level_type, *args]  # fmt: skip
+        version = ["--pack-version", self.pack_version] if self.pack_version else []
+        cmd = ["uv", "run", "orch", *version, "--server", self.server, "--port", str(self.port),
+               "--rcon-port", str(self.rcon_port), "--level", self.level, "--level-type", self.level_type, *args]  # fmt: skip
         print(f"[cameras] {subprocess.list2cmdline(cmd)}", flush=True)
         proc = subprocess.run(cmd, cwd=self.checkout, capture_output=True, text=True)
         if proc.stdout.strip():

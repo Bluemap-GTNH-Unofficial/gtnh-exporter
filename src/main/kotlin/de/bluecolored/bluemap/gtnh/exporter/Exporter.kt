@@ -15,7 +15,8 @@ class Exporter(private val mc: Minecraft, private val outDir: File, private val 
         outDir.mkdirs()
         // `-Dbluemap.gtnh.exporter.packSuffix=modernity` -> bluemap-gtnh-resources-<version>-modernity.zip
         val suffix = System.getProperty("bluemap.gtnh.exporter.packSuffix")?.takeIf { it.isNotBlank() }?.let { "-$it" } ?: ""
-        val zip = File(outDir, "bluemap-gtnh-resources-$PACK_VERSION$suffix.zip")
+        val packVersion = packVersion(Loader.instance().configDir)
+        val zip = File(outDir, "bluemap-gtnh-resources-$packVersion$suffix.zip")
         val partial = File(outDir, zip.name + ".part")
         val extraStates = BlockExporter.parseExtraStates(extraStatesFile)
         ExporterMod.log.info("Exporting to {} ({} extra states)", zip, extraStates.values.sumOf { it.size })
@@ -29,7 +30,7 @@ class Exporter(private val mc: Minecraft, private val outDir: File, private val 
                         "pack",
                         JsonObject().apply {
                             addProperty("pack_format", 4)
-                            addProperty("description", "GT New Horizons $PACK_VERSION modded blocks for BlueMap (generated)")
+                            addProperty("description", "GT New Horizons $packVersion modded blocks for BlueMap (generated)")
                         },
                     )
                 },
@@ -97,7 +98,7 @@ class Exporter(private val mc: Minecraft, private val outDir: File, private val 
             }
             val totalJson = total.toJson().apply { remove("failedStates") }
 
-            report.addProperty("packVersion", PACK_VERSION)
+            report.addProperty("packVersion", packVersion)
             report.addProperty("zip", zip.name)
             report.add("total", totalJson)
             report.add(
@@ -121,6 +122,18 @@ class Exporter(private val mc: Minecraft, private val outDir: File, private val 
     }
 
     companion object {
-        const val PACK_VERSION = "2.9.0-RC-2"
+        const val PACK_VERSION_PROPERTY = "bluemap.gtnh.exporter.packVersion"
+        private val MOD_PACK_VERSION = Regex("""^\s*S:ModPackVersion=(\S+)\s*$""", RegexOption.MULTILINE)
+
+        /**
+         * The GTNH pack version in the pack's name: `-Dbluemap.gtnh.exporter.packVersion=<version>` if set, else the
+         * version the pack reports itself (`S:ModPackVersion` in GTNH Core Mod's `config/GTNewHorizons/dreamcraft.cfg`).
+         */
+        fun packVersion(configDir: File): String {
+            System.getProperty(PACK_VERSION_PROPERTY)?.takeIf { it.isNotBlank() }?.let { return it }
+            val config = File(configDir, "GTNewHorizons/dreamcraft.cfg")
+            val version = if (config.isFile) MOD_PACK_VERSION.find(config.readText())?.groupValues?.get(1) else null
+            return version ?: error("unknown GTNH pack version: no S:ModPackVersion in $config; set -D$PACK_VERSION_PROPERTY")
+        }
     }
 }
