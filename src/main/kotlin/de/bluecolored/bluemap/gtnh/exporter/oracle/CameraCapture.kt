@@ -72,11 +72,12 @@ import kotlin.math.min
  *
  * The spec lists jobs, each a scene world the launcher copied into `saves/`. From the main menu the client opens each
  * job's save as a single-player world (integrated server, no dedicated server or RCON), captures its cameras, returns
- * to the main menu and opens the next save, all in one client session. Before the player joins, the integrated server
- * runs `bmh random-ticks off` (the harness mod `bmh` is loaded into the client for this; it also keeps the scene's
- * frozen tile entities unticked), sets the job's `remove` cells to air with `bmh set`, noon, clear weather, no daylight
- * cycle and no mob spawning. Its chunk radius is the spec's `viewDistance` (the dedicated scene server's), not the
- * client's render distance.
+ * to the main menu, waits until the integrated server's thread has ended and opens the next save, all in one client
+ * session. A job whose integrated server does not start or stops fails at once and the next job starts. Before the
+ * player joins, the integrated server runs `bmh random-ticks off` (the harness mod `bmh` is loaded into the client for
+ * this; it also keeps the scene's frozen tile entities unticked), sets the job's `remove` cells to air with `bmh set`,
+ * noon, clear weather, no daylight cycle and no mob spawning. Its chunk radius is the spec's `viewDistance` (the
+ * dedicated scene server's), not the client's render distance.
  *
  * Per camera: `tp` on the integrated server, pin position and rotation on the client every tick and frame, wait until
  * every chunk of the scene box within the view distance has been on the client for `loadTicks` ticks, then freeze the
@@ -87,6 +88,8 @@ import kotlin.math.min
  * colour (`<view>.png`), depth (`<view>.depth.bin`, float32 little endian, rows top to bottom, GL window depth 0..1)
  * and the projection and modelview matrices plus the camera position (`<view>.json`). Each job's
  * `cameras-report.json` summarises it; after the last job the client quits (exit 1 if any camera or job failed).
+ * A crash report written while a job runs fails the job ([checkCrash]): GTNH's BetterCrashes keeps a crashed client
+ * running, so its frames would otherwise be captured from a broken renderer or never come.
  *
  * Capture conditions (see the launcher README): no GUI, hand or block outline; flat lighting (smooth lighting off) with
  * a white lightmap (full brightness everywhere, vanilla's per-face shading 1.0 / 0.8 / 0.6 / 0.5 stays); no fog
@@ -103,6 +106,14 @@ object CameraCapture {
     private const val MENU_TICKS = 20 // at the main menu this long before the first world is opened
     private const val JOIN_SETTLE_TICKS = 10
     private const val TELEPORT_TIMEOUT_SECONDS = 30.0
+    private const val SERVER_STOP_TIMEOUT_SECONDS = 60.0 // the previous integrated server's thread must end by then
+    private const val WAIT_LOG_SECONDS = 30.0
+    private const val STALL_LOG_SECONDS = 30.0 // the watchdog logs the thread stacks this often while the capture is stuck
+    // Minecraft's Timer drops the time of a frame longer than 1 s (Timer.updateTimer): with such frames no client tick
+    // runs at all, so the capture then steps on frames once this long has passed without a step
+    private const val STEP_STARVED_SECONDS = 1.0
+    private const val CRASH_CHECK_SECONDS = 1.0 // how often the capture looks for a new crash report
+    private const val CRASH_REPORT_LINES = 200 // the report's head with its description, exception and block details
     private const val CHANGED_CHANNEL_DELTA = 8
     private const val FOG_DISTANCE = 1.0e6f
     private const val FROZEN_WORLD_TIME = 0L // client total world time while frozen: animated TESRs at "frame 0"
@@ -147,12 +158,14 @@ object CameraCapture {
     private enum class Phase { MENU, JOINING, SETUP, TELEPORT, LOAD, STABILIZE, CAPTURE, LEAVE, FINISHED }
 
     private lateinit var spec: Spec
-    private var phase = Phase.MENU
+    @Volatile private var phase = Phase.MENU
     private var phaseTicks = 0
     private var phaseStarted = 0L
+    private var waitLogs = 0 // logWaiting lines of the current phase
     private var started = 0L
     private var menuTicks = 0
     private var bootSeconds = Double.NaN
+    @Volatile private var lastStep = 0L // read by the watchdog thread
 
     // per job
     private var jobIndex = -1
@@ -166,6 +179,8 @@ object CameraCapture {
     private var failures = 0
     private val sessionJobs = JsonArray()
     private var failedJobs = 0
+    private var crashReportsBefore: Set<String> = emptySet() // crash-reports/ when the job started
+    private var crashCheckedAt = 0L
 
     @Volatile private var setupDone = false
     @Volatile private var serverError: String? = null
@@ -175,10 +190,9 @@ object CameraCapture {
     /** The server's side of the player's chunks: square centre, chunks already sent, chunks still queued. */
     private class ServerView(val centreX: Int, val centreZ: Int, val sent: LongArray, val queued: Int)
 
-    /** Published by the integrated server thread every tick while a camera waits for chunks. */
+    /** Published by the integrated server thread every tick while a camera waits for chunks ([viewWanted]). */
     @Volatile private var serverView: ServerView? = null
-    @Volatile private var probing = false
-    private var probeTicks = 0 // server thread
+    @Volatile private var viewWanted = false
 
     // per camera
     private var cameraStarted = 0L
@@ -260,6 +274,7 @@ object CameraCapture {
         phaseStarted = started
         FMLCommonHandler.instance().bus().register(this)
         MinecraftForge.EVENT_BUS.register(this)
+        startWatchdog(Thread.currentThread())
         log.info("Camera mode: {} jobs, {} cameras", spec.jobs.size, spec.jobs.sumOf { it.cameras.size })
     }
 
@@ -361,6 +376,7 @@ object CameraCapture {
         phase = next
         phaseTicks = 0
         phaseStarted = System.nanoTime()
+        waitLogs = 0
     }
 
     private fun seconds(since: Long) = (System.nanoTime() - since) / 1e9
@@ -404,16 +420,15 @@ object CameraCapture {
                 serverError = "${t.javaClass.simpleName}: ${t.message}"
             }
         }
-        if (probing) probe(server)
+        if (viewWanted) publishServerView(server)
     }
 
     /**
      * Publishes [serverView]: the chunks the server has sent the player (watched and no longer queued) and how many it
      * still has queued. `PlayerManager` moves a player's square only after a move of 8 blocks from its `managedPos`, so
-     * the client waits for exactly what the server sends rather than for a square it computes itself. Logs the server's
-     * side of the transfer every 5 s while a camera waits for chunks.
+     * the client waits for exactly what the server sends rather than for a square it computes itself.
      */
-    private fun probe(server: MinecraftServer) {
+    private fun publishServerView(server: MinecraftServer) {
         val player = server.configurationManager?.func_152612_a(playerName) ?: return
         val world = player.worldObj as WorldServer
         val cx = player.managedPosX.toInt() shr 4
@@ -424,10 +439,6 @@ object CameraCapture {
             if (world.playerManager.isPlayerWatchingChunk(player, x, z)) sent += chunkKey(x, z)
         }
         serverView = ServerView(cx, cz, sent.toLongArray(), player.loadedChunks.size)
-        if (++probeTicks % 100 != 0) return
-        log.info("Camera server side: player at {} {} (square centre {} {}), {} chunks sent, {} queued, {} chunks loaded in the world; " +
-            "ticks {}, in entity list {}", fmt(player.posX), fmt(player.posZ), cx, cz, sent.size, player.loadedChunks.size,
-            world.theChunkProviderServer.loadedChunkCount, player.ticksExisted, world.loadedEntityList.contains(player))
     }
 
     private fun chunkKey(x: Int, z: Int) = (x.toLong() shl 32) or (z.toLong() and 0xffffffffL)
@@ -469,27 +480,53 @@ object CameraCapture {
     fun onClientTick(event: TickEvent.ClientTickEvent) {
         if (phase == Phase.FINISHED) return
         val mc = Minecraft.getMinecraft()
-        try {
-            if (event.phase == TickEvent.Phase.START) {
+        if (event.phase == TickEvent.Phase.START) {
+            try {
                 pin(mc)
-                return
+            } catch (t: Throwable) {
+                failed(mc, t)
             }
+            return
+        }
+        advance(mc)
+    }
+
+    /** One step of the capture: every client tick, and every frame while no client tick runs ([onRenderTick]). */
+    private fun advance(mc: Minecraft) {
+        lastStep = System.nanoTime()
+        try {
             pin(mc)
             phaseTicks++
             step(mc)
             if (inWorld) ensureSize(mc, rebind = false)
         } catch (t: Throwable) {
-            log.fatal("Camera capture failed", t)
-            if (jobIndex >= 0 && inWorld || phase == Phase.JOINING) jobFailed(mc, "${t.javaClass.simpleName}: ${t.message}")
-            else finishSession(mc, "${t.javaClass.simpleName}: ${t.message}")
+            failed(mc, t)
         }
+    }
+
+    private fun failed(mc: Minecraft, t: Throwable) {
+        log.fatal("Camera capture failed", t)
+        if (jobIndex >= 0 && inWorld || phase == Phase.JOINING) jobFailed(mc, "${t.javaClass.simpleName}: ${t.message}")
+        else finishSession(mc, "${t.javaClass.simpleName}: ${t.message}")
     }
 
     private fun step(mc: Minecraft) {
         if (inWorld || phase == Phase.JOINING) {
+            checkCrash(mc)
             serverError?.let { throw IllegalStateException("integrated server: $it") }
+            val server = mc.integratedServer
+            if (server == null || server.isServerStopped) {
+                // a server that failed to start or crashed: its errors are in the log above (and in crash-reports/)
+                throw IllegalStateException(
+                    if (phase == Phase.JOINING) "the integrated server did not start or stopped before the player joined"
+                    else "the integrated server stopped (screen ${mc.currentScreen?.javaClass?.name})",
+                )
+            }
             if (phase != Phase.JOINING && (mc.theWorld == null || mc.currentScreen is GuiDisconnected)) {
                 throw IllegalStateException("left the world (screen ${mc.currentScreen?.javaClass?.name})")
+            }
+            if (phase == Phase.JOINING) logWaiting("job ${job.scene}: joining the world") {
+                "screen ${mc.currentScreen?.javaClass?.name}, client world ${mc.theWorld != null}, setup done $setupDone"
             }
         }
         when (phase) {
@@ -586,6 +623,8 @@ object CameraCapture {
         setupDone = false
         serverError = null
         serverTasks.clear()
+        crashReportsBefore = crashReports(mc)
+        crashCheckedAt = System.nanoTime()
         j.outDir.mkdirs()
         log.info("Camera job {}/{}: scene {} (save {}), {} cameras -> {}", next + 1, spec.jobs.size, j.scene, j.save,
             j.cameras.size, j.outDir)
@@ -632,7 +671,7 @@ object CameraCapture {
         stableTimedOut = false
         teleportReply = ""
         serverView = null
-        probing = true
+        viewWanted = true
         val name = playerName
         onServer {
             preloadSquare(it, c.x, c.z)
@@ -646,7 +685,7 @@ object CameraCapture {
     /** Pauses the game behind [FreezeScreen]: the world, its entities, tile entities, particles and textures stop. */
     private fun freeze(mc: Minecraft) {
         frozen = true
-        probing = false
+        viewWanted = false
         frozenFrames = 0
         mc.displayGuiScreen(FreezeScreen)
     }
@@ -723,41 +762,59 @@ object CameraCapture {
         })
     }
 
-    /** Back to the main menu (the integrated server saves and stops), then the next job or the end of the session. */
+    /**
+     * Back to the main menu (the integrated server saves and stops), then the next job or the end of the session. The
+     * next save is opened only once the previous integrated server's thread has ended: `loadWorld(null)` returns when
+     * the server reports itself stopped, but its thread still runs the mods' `FMLServerStoppedEvent` handlers. A server
+     * started meanwhile loses `MinecraftServer.getServer()` (MineTweaker's `FMLServerAboutToStartEvent` then throws),
+     * FML's state machine errs and the save never opens.
+     */
     private fun leaveWorld(mc: Minecraft) {
         if (phaseTicks == 1) {
-            val leaving = System.nanoTime()
             unfreeze(mc)
-            if (mc.theWorld != null) {
-                mc.theWorld.sendQuittingDisconnectingPacket()
-                mc.loadWorld(null)
-            }
+            mc.theWorld?.sendQuittingDisconnectingPacket()
+            // also a server whose player never joined: it must not run into the next job
+            if (mc.theWorld != null || mc.integratedServer != null) mc.loadWorld(null)
             mc.displayGuiScreen(GuiMainMenu())
-            val leave = seconds(leaving)
-            (sessionJobs.lastOrNull() as? JsonObject)?.getAsJsonObject("timings")?.addProperty("leave", leave)
-            log.info("Camera job {} done in {} s (leaving {} s)", job.scene, seconds(jobStarted), leave)
             return
         }
+        val running = serverThreads()
+        if (running.isNotEmpty()) {
+            if (seconds(phaseStarted) > SERVER_STOP_TIMEOUT_SECONDS) {
+                log.error("Camera job {}: the integrated server thread still runs after {} s:\n{}", job.scene,
+                    SERVER_STOP_TIMEOUT_SECONDS, running.joinToString("\n") { stackTrace(it) })
+                finishSession(mc, "the integrated server of job ${job.scene} did not stop within $SERVER_STOP_TIMEOUT_SECONDS s")
+                return
+            }
+            logWaiting("job ${job.scene}: waiting for the integrated server thread to end") { stackTrace(running[0]) }
+            return
+        }
+        val leave = seconds(phaseStarted)
+        (sessionJobs.lastOrNull() as? JsonObject)?.getAsJsonObject("timings")?.addProperty("leave", leave)
+        log.info("Camera job {} done in {} s (leaving {} s)", job.scene, seconds(jobStarted), leave)
         if (jobIndex + 1 < spec.jobs.size) startJob(mc, jobIndex + 1) else finishSession(mc, null)
+    }
+
+    /** Live integrated server threads (`MinecraftServer.startServerThread` names them "Server thread"). */
+    private fun serverThreads(): List<Thread> =
+        Thread.getAllStackTraces().keys.filter { it.name == "Server thread" && it.isAlive && it !== Thread.currentThread() }
+
+    private fun stackTrace(thread: Thread) =
+        "\"${thread.name}\" ${thread.state}\n" + thread.stackTrace.take(20).joinToString("\n") { "\tat $it" }
+
+    /** A line every [WAIT_LOG_SECONDS] of a phase that is still waiting, so a slow wait shows in the log. */
+    private fun logWaiting(what: String, state: () -> String) {
+        val waited = seconds(phaseStarted)
+        if (waited < (waitLogs + 1) * WAIT_LOG_SECONDS) return
+        waitLogs++
+        log.info("Camera {} for {} s: {}", what, waited.toInt(), state())
     }
 
     private fun finishSession(mc: Minecraft, error: String?) {
         if (phase == Phase.FINISHED) return
         phase = Phase.FINISHED
         pinned = null
-        spec.session?.let { file ->
-            val report = JsonObject().apply {
-                addProperty("capture_version", spec.captureVersion)
-                addProperty("jobs", spec.jobs.size)
-                addProperty("failedJobs", failedJobs + (spec.jobs.size - sessionJobs.size()))
-                error?.let { addProperty("error", it) }
-                addProperty("bootSeconds", bootSeconds)
-                addProperty("seconds", seconds(started))
-                add("results", sessionJobs)
-            }
-            file.parentFile?.mkdirs()
-            file.writeText(PackWriter.PRETTY_GSON.toJson(report))
-        }
+        writeSession(error)
         if (System.getProperty("bluemap.gtnh.exporter.stay") == "true") return
         if (error == null && failedJobs == 0) {
             log.info("Camera capture finished, shutting down the client")
@@ -765,6 +822,116 @@ object CameraCapture {
         } else {
             log.error("Camera capture finished with errors ({}), exiting with 1", error ?: "$failedJobs jobs failed")
             FMLCommonHandler.instance().exitJava(1, false)
+        }
+    }
+
+    private fun writeSession(error: String?) {
+        val file = spec.session ?: return
+        val report = JsonObject().apply {
+            addProperty("capture_version", spec.captureVersion)
+            addProperty("jobs", spec.jobs.size)
+            addProperty("failedJobs", failedJobs + (spec.jobs.size - sessionJobs.size()))
+            error?.let { addProperty("error", it) }
+            addProperty("bootSeconds", bootSeconds)
+            addProperty("seconds", seconds(started))
+            add("results", sessionJobs)
+        }
+        file.parentFile?.mkdirs()
+        file.writeText(PackWriter.PRETTY_GSON.toJson(report))
+    }
+
+    private fun crashReportDir(mc: Minecraft) = File(mc.mcDataDir, "crash-reports")
+
+    private fun crashReports(mc: Minecraft): Set<String> = crashReportDir(mc).list()?.toSet() ?: emptySet()
+
+    /**
+     * Fails the job on a crash report written since it started. GTNH's BetterCrashes catches an exception of the game
+     * loop, writes the report, resets the game state and lets the client go on, so the capture would not notice: a
+     * block whose rendering throws fails its whole chunk mesh (Angelica's chunk builder), and Angelica's renderer may
+     * not survive the reset (`Executor is stopped` every frame, then no frame at all is drawn). The job's error is the
+     * report's description and exception plus, for a block that threw while rendered, the block, its meta and location.
+     */
+    private fun checkCrash(mc: Minecraft) {
+        if (seconds(crashCheckedAt) < CRASH_CHECK_SECONDS) return
+        crashCheckedAt = System.nanoTime()
+        // crash-<yyyy-MM-dd_HH.mm.ss>-<side>.txt: the first in name order is the first crash
+        val first = (crashReports(mc) - crashReportsBefore).minOrNull() ?: return
+        throw IllegalStateException("the client crashed: " + crashSummary(File(crashReportDir(mc), first)))
+    }
+
+    private fun crashSummary(report: File): String {
+        val head = runCatching { report.bufferedReader(Charsets.UTF_8).useLines { it.take(CRASH_REPORT_LINES).toList() } }
+            .getOrElse { return "${report.name} (unreadable: $it)" }
+        val description = head.indexOfFirst { it.startsWith("Description: ") }
+        if (description < 0) return "${report.name} (no description in its first ${head.size} lines)"
+        val exception = head.drop(description + 1).firstOrNull { it.isNotBlank() }
+        fun detail(key: String) = head.firstOrNull { it.startsWith("    $key: ") }?.substringAfter(": ")
+        val block = detail("Block")?.let { "; block $it, meta ${detail("Block meta")}, ${detail("Block location")}" } ?: ""
+        return "${head[description].removePrefix("Description: ")}: $exception$block (crash-reports/${report.name})"
+    }
+
+    /**
+     * Every wait of the capture runs on client ticks or frames, so a client thread that is stuck (blocked in, or looping
+     * through, a Minecraft or mod call; a single frame that does not end) would wait silently until the launcher's
+     * timeout. This thread logs the client and server threads' stacks every [STALL_LOG_SECONDS] while the capture has
+     * not stepped, and after [Spec.worldTimeoutSeconds] writes the session report and kills the client ([killClient]).
+     */
+    private fun startWatchdog(client: Thread) {
+        val watchdog = Thread({
+            var logged = 0
+            while (phase != Phase.FINISHED) {
+                Thread.sleep(1000)
+                val last = lastStep
+                if (last == 0L) continue // still loading: no client tick yet
+                val stalled = (System.nanoTime() - last) / 1e9
+                if (stalled < STALL_LOG_SECONDS) {
+                    logged = 0
+                    continue
+                }
+                if (stalled >= (logged + 1) * STALL_LOG_SECONDS) {
+                    logged++
+                    log.warn("Camera capture: no step for {} s ({}{}):\n{}", stalled.toInt(), phase,
+                        if (jobIndex >= 0) ", job ${job.scene}" else "", threadDump(client))
+                }
+                if (stalled > spec.worldTimeoutSeconds && phase != Phase.FINISHED) {
+                    val error = "the client thread made no progress for ${stalled.toInt()} s ($phase" +
+                        (if (jobIndex >= 0) ", job ${job.scene}" else "") + "; its stack is in the log)"
+                    log.error("Camera capture failed: {}; killing the client", error)
+                    runCatching { writeSession(error) }.onFailure { log.error("Writing the session report failed", it) }
+                    System.out.flush()
+                    killClient()
+                }
+            }
+        }, "Camera capture watchdog")
+        watchdog.isDaemon = true
+        watchdog.start()
+    }
+
+    /**
+     * Ends this JVM without waiting for any of its threads. Neither System.exit (shutdown hooks wait for the stuck
+     * threads) nor Runtime.halt (the GL driver's exit handlers wait for the draw call in progress) ends a client stuck
+     * in a frame, so the process kills itself from outside: SIGKILL, on Windows `taskkill /F` (TerminateProcess, exit
+     * code 1). Should that fail, FML's hard exit: a Runtime.halt or System.exit in mod code throws FML's
+     * ExitTrappedException instead (TerminalTransformer), so a mod can only exit through FMLCommonHandler.exitJava.
+     */
+    private fun killClient() {
+        val pid = ProcessHandle.current().pid().toString()
+        val kill = if (System.getProperty("os.name").startsWith("Windows")) listOf("taskkill", "/F", "/PID", pid)
+        else listOf("kill", "-KILL", pid)
+        runCatching { ProcessBuilder(kill).inheritIO().start().waitFor() }
+            .onFailure { log.error("Killing the client with `{}` failed", kill.joinToString(" "), it) }
+        FMLCommonHandler.instance().exitJava(1, true)
+    }
+
+    /** The client thread's stack, the owner of the lock it waits for, and every integrated server thread's. */
+    private fun threadDump(client: Thread): String {
+        val infos = ManagementFactory.getThreadMXBean().dumpAllThreads(true, true).filterNotNull()
+        val clientInfo = infos.firstOrNull { it.threadName == client.name }
+        val names = setOfNotNull(client.name, "Server thread", clientInfo?.lockOwnerName)
+        return infos.filter { it.threadName in names }.joinToString("\n") { info ->
+            "\"${info.threadName}\" ${info.threadState}" + (info.lockName?.let { " on $it" } ?: "") +
+                (info.lockOwnerName?.let { " owned by \"$it\"" } ?: "") + "\n" +
+                info.stackTrace.take(40).joinToString("\n") { "\tat $it" }
         }
     }
 
@@ -808,6 +975,10 @@ object CameraCapture {
         if (event.phase != TickEvent.Phase.START || !inWorld) return
         val mc = Minecraft.getMinecraft()
         if (mc.theWorld == null || mc.thePlayer == null) return
+        if (seconds(lastStep) > STEP_STARVED_SECONDS) {
+            advance(mc)
+            if (!inWorld) return
+        }
         try {
             frames++
             pin(mc)
@@ -917,6 +1088,7 @@ object CameraCapture {
                 captureRequested = false
                 return
             }
+            if (phase == Phase.CAPTURE) return // captured: the next step moves on to the next camera
             lastTerrain = terrainComplete(mc)
             if (lastTerrain == false) {
                 stableCount = 0

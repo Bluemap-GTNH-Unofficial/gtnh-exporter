@@ -47,10 +47,13 @@ the Mojang/Forge/LWJGL3 libraries and assets (cache `WS/downloads/mc-cache`), st
 
 The pack version (`--pack-version`, only `2.9.0`, the default) picks the per-version workspace directories, which end
 in `-<version>`; the launcher refuses a client whose own version (`dreamcraft.cfg` `ModPackVersion`) differs from it.
-The export takes about 51 s of client run time: 4,087 blocks, 61,468 states from 138 mods.
+The export takes about 51 s of client run time; on 2.9.0 it covers <!-- n:exports.default.blocks -->4,087<!-- /n -->
+blocks with their <!-- n:exports.default.states -->61,468<!-- /n --> states, from a total of
+the <!-- n:exports.default.mods -->138<!-- /n --> mods.
 
 Build alone: `mise exec java@temurin-25.0.5+8.0.LTS -- ./gradlew -Porg.gradle.java.installations.paths=$(mise where java@zulu-8.98.0.107)/Contents/Home,$(mise where java@temurin-25.0.5+8.0.LTS)/Contents/Home build`
-(Kotlin Gradle plugin forced to 2.3.21 in `settings.gradle.kts`). The resource-key normalization
+(installation paths: the `mise where` directories, with `/Contents/Home` appended only on macOS; in the umbrella
+workspace `../pipeline/gradlew` does this; Kotlin Gradle plugin forced to 2.3.21 in `settings.gradle.kts`). The resource-key normalization
 `legacy/.../ResourceKeys.kt` of the BlueMap fork is compiled in verbatim (`syncSharedKotlin`, read from the sibling
 checkout `WS/BlueMap`; the build fails if it is missing), so mapper and exporter cannot diverge.
 
@@ -84,8 +87,9 @@ ore entry; see the orchestrator README), then
 `export --client-dir WS/clients/gtnh-addons-2.9.0 --out WS/out/exporter-addons-2.9.0 --pack-suffix addons --extra-mod <jar>...`
 with `--extra-states-dump` of `gtnh-zoo`, `addons-zoo`, `addons-machines` and `addons-multiblocks`
 (`WS/out/scenes-2.9.0/<scene>/dump.ndjson`), which writes `bluemap-gtnh-resources-2.9.0-addons.zip`. The GT dump then
-holds every addon MTE and the addon casing texture pages (31, 114, 115, 116) with no exporter change (on 2.9.0: 4,450
-of 4,450 MTEs, 580 casings, 0 errors).
+holds every addon MTE and the addon casing texture pages (31, 114, 115, 116) with no exporter change (on 2.9.0
+the dump has <!-- n:exports.addons.mteOk -->4,450<!-- /n --> of <!-- n:exports.addons.mte -->4,450<!-- /n --> MTEs,
+with <!-- n:exports.addons.casings -->580<!-- /n --> casings, <!-- n:exports.addons.mteFailed -->0<!-- /n --> failures).
 
 Placeholder icons (`missingno`, Forge `MISSING_ICON_BLOCK_*`, Angelica `error_block_*`, which Angelica returns instead of
 null icons) count as missing: probed metas with only placeholders are dropped, cubes need real icons, and a capture that
@@ -119,7 +123,8 @@ containing the quad's UV centroid (quads outside every sprite are dropped, count
 for quads lying on a block face and facing out.
 
 **Textures** `assets/<ns>/textures/block/<N(path segments)>.png`, `ns` = N(icon domain), vanilla icons under
-`gtnh_minecraft_1_7` (not to clash with 1.13 textures). Source: the PNG through the resource manager (`.png.mcmeta`
+`gtnh_minecraft_1_7` (not to clash with 1.13 textures). Source: the PNG through the resource manager under the
+lower-cased icon domain, as `TextureMap` resolves it (`GoodGenerator:x` -> `assets/goodgenerator/`; `.png.mcmeta`
 re-serialized leniently — some mods ship trailing commas, which BlueMap's parser rejects together with the texture;
 strips without one are cut to the first frame), else the sprite's frame data, else a crop of the GL atlas.
 
@@ -200,8 +205,8 @@ Output (`bluemap.gtnh.exporter.out`): `<ns>/<value>/<meta>.png` (straight-alpha 
 camera, conditions, render seconds and per state `key` (`<ns>:<value>[meta=<meta>]`), `name`, `meta`, `path`,
 `renderType`, `class`, `passes`, `quads`, `tileEntity`, `te` (base64 of the tile entity's uncompressed NBT; `teError`
 if it could not be written, BlueMap then gets no tile entity), `tesr`, `blank` (nothing drawn), `worldMeta`/`mte`
-(GregTech machines), `glError` and `error` (render exceptions; the state is still written). On 2.9.0, 62,659 states
-take 32 s plus the client boot.
+(GregTech machines), `glError` and `error` (render exceptions; the state is still written). On 2.9.0, the
+states (<!-- n:states.default.states -->62,659<!-- /n -->) take 32 s plus the client boot.
 
 ## GregTech dump (gtnh/gregtech/)
 

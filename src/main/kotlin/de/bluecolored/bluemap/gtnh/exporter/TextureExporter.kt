@@ -72,6 +72,9 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
         if (name in exported) return exported[name]
         val (namespace, value) = PackKeys.textureKey(name)
         val path = "assets/$namespace/textures/$value.png"
+        // cached before writing: a `myctmlib` section whose `equivalents` list the texture itself or loop back to it
+        // (Modernity-GTNH's MACHINE_DIM_TRANS_CASING, EM_FIELD_*, ...) exports it again from within its own write
+        exported[name] = "$namespace:$value"
         val source = try {
             write(name, sprite, path)
         } catch (ex: Exception) {
@@ -86,7 +89,9 @@ class TextureExporter(private val mc: Minecraft, private val pack: PackWriter) {
 
     private fun write(name: String, sprite: TextureAtlasSprite?, path: String): Source {
         val colon = name.indexOf(':')
-        val domain = if (colon < 0) "minecraft" else name.substring(0, colon)
+        // lower case, as TextureMap resolves an icon name (`ResourceLocation(String)`); the two-argument constructor
+        // keeps the case, so `GoodGenerator:x` would miss assets/goodgenerator/ and its `.mcmeta`
+        val domain = if (colon < 0) "minecraft" else name.substring(0, colon).lowercase()
         val iconPath = if (colon < 0) name else name.substring(colon + 1)
         val location = ResourceLocation(domain, "textures/blocks/$iconPath.png")
 
