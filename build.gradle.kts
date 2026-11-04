@@ -8,7 +8,7 @@ plugins {
 }
 
 // Fixed version instead of GTNHGradle's git-based versioning.
-val exporterVersion = "0.2.0"
+val exporterVersion = "0.2.1"
 extra["modVersion"] = exporterVersion
 version = exporterVersion
 
