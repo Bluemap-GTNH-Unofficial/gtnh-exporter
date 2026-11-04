@@ -150,6 +150,9 @@ def test_capture_settings_restore_on_error_and_remove_new_options(tmp_path: Path
     with pytest.raises(RuntimeError):
         with cameras.capture_settings(mc):
             assert (mc / "options.txt").is_file()
+            data = json.loads((mc / "config" / "angelica-options.json").read_text())
+            assert data["quality"] == {"texel_sampling": "NEAREST", "texture_filter_mode": "NONE"}
+            assert data["performance"] == {"use_fog_occlusion": False}
             raise RuntimeError("client failed")
     assert not (mc / "options.txt").exists()
     assert not (mc / "config" / "angelica-options.json").exists()
@@ -162,6 +165,10 @@ def test_outputs_are_cleaned_and_checked(tmp_path: Path):
     cameras.clean_outputs(tmp_path, CAMERAS)
     assert not any(tmp_path.iterdir())
     assert cameras.check_outputs(tmp_path, CAMERAS, started) == [f"{tmp_path / cameras.REPORT} missing or older than this run"]
+    # the client ended before the job's report (the watchdog killed a stuck client): the session's error says why
+    stuck = "the client thread made no progress for 300 s (STABILIZE, job vanilla-zoo; its stack is in the log)"
+    assert cameras.check_outputs(tmp_path, CAMERAS, started, stuck) == [
+        f"{tmp_path / cameras.REPORT} missing or older than this run; client session error: {stuck}"]
     _write(tmp_path / cameras.REPORT, {"capture_version": cameras.CAPTURE_VERSION})
     for suffix in (".png", ".depth.bin"):
         (tmp_path / f"south{suffix}").write_text("new")

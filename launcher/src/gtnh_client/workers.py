@@ -3,8 +3,9 @@
 Worker `i` of a base client `WS/clients/<name>` is `WS/clients/<name>-worker-<i>/` with its own game directory
 `.minecraft/` (mods, configs, options, saves, logs), mirrored from the base's before every run. The pack itself
 (patches, instance libraries, natives) is the base's, and libraries and assets come from the shared download cache, so
-a worker is a [Layout] with `game_dir` set. Copies are APFS clones (`clonefile`, copy on write) where the file system
-supports them, so a worker costs almost no disk space and is created in about a second.
+a worker is a [Layout] with `game_dir` set. Copies are APFS clones (`clonefile`, copy on write) on macOS, so a worker
+costs almost no disk space there and is created in about a second; elsewhere (Linux) they are plain copies (about 1 GB
+per worker, made once: later mirrors copy only what changed).
 """
 
 from __future__ import annotations
@@ -43,7 +44,7 @@ _clonefile = _load_clonefile()
 
 def clone(src: Path, dst: Path) -> None:
     """Copies a file or a whole directory tree to `dst` (which must not exist), keeping modification times: one APFS
-    `clonefile` call where possible, else `shutil.copy2`/`copytree`."""
+    `clonefile` call on macOS where possible, else `shutil.copy2`/`copytree`."""
     if _clonefile is not None and _clonefile(os.fsencode(src), os.fsencode(dst), 0) == 0:
         return
     if src.is_dir():

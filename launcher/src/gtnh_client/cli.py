@@ -1,4 +1,4 @@
-"""`gtnh-client` command line: prepare / run / play / export / cameras / coverage / screens."""
+"""`gtnh-client` command line: prepare / run / play / export / cameras / states / coverage / screens / serve."""
 
 from __future__ import annotations
 
@@ -13,9 +13,9 @@ import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
-from gtnh_client import cameras, coverage, lock, packs, states, workers
+from gtnh_client import bridge, cameras, coverage, lock, packs, states, workers
 from gtnh_client.proxy import DelayProxy
 from gtnh_client.download import DownloadError
 from gtnh_client.instance import Layout, PrepareError, ensure_downloads, prepare
@@ -24,9 +24,9 @@ from gtnh_client.launch import (
     LWJGL3IFY_WINDOW,
     MUTE_OPTION,
     ClientProcess,
+    LaunchError,
     build_command,
     configure_lwjgl3ify,
-    group_rss_kib,
     install_mods,
     install_resource_packs,
     keep_awake,
@@ -34,7 +34,10 @@ from gtnh_client.launch import (
     restore_resource_packs,
     run_process,
     run_processes,
+    tree_rss_kib,
+    virtual_display,
 )
+from gtnh_client.pathmap import PathMapError
 from gtnh_client.profile import ProfileError
 
 ZULU8_TOOL = "java@zulu-8.98.0.107"
@@ -163,12 +166,13 @@ def run_client(
         cmd = build_command(layout, profile, xmx=xmx, jvm_args=jvm_args, username=username, game_args=list(game_args))
         log = log or default_log(layout)
         print(f"[run] log: {log}", flush=True)
-        with keep_awake(timeout):
-            return run_process(cmd, cwd=layout.minecraft_dir, log_file=log, timeout=timeout)
+        with keep_awake(timeout), virtual_display(log.with_suffix(".xvfb.log")) as env:
+            return run_process(cmd, cwd=layout.minecraft_dir, log_file=log, timeout=timeout, env=env)
 
 
 class Terminated(KeyboardInterrupt):
-    """SIGTERM/SIGHUP delivered as an interrupt, so cleanup runs; `signum` sets the exit code (128 + signum)."""
+    """SIGTERM/SIGHUP (Windows: SIGBREAK) delivered as an interrupt, so cleanup runs; `signum` sets the exit code
+    (128 + signum)."""
 
     def __init__(self, signum: int):
         super().__init__(f"signal {signum}")
@@ -179,11 +183,15 @@ def _interrupt(signum: int, frame) -> None:
     raise Terminated(signum)
 
 
+# SIGTERM, and the caller's terminal going away: SIGHUP, on Windows the console's Ctrl-Break (SIGBREAK)
+TERMINATE_SIGNALS = tuple(getattr(signal, name) for name in ("SIGTERM", "SIGHUP", "SIGBREAK") if hasattr(signal, name))
+
+
 @contextlib.contextmanager
 def terminate_as_interrupt():
-    """SIGTERM/SIGHUP (e.g. the caller's process group is terminated) raise [Terminated] in the main thread, so the
-    client process trees are killed and the run's cleanup happens."""
-    previous = {sig: signal.signal(sig, _interrupt) for sig in (signal.SIGTERM, signal.SIGHUP)}
+    """[TERMINATE_SIGNALS] (e.g. the caller's process group is terminated) raise [Terminated] in the main thread, so
+    the client process trees are killed and the run's cleanup happens."""
+    previous = {sig: signal.signal(sig, _interrupt) for sig in TERMINATE_SIGNALS}
     try:
         yield
     finally:
@@ -207,13 +215,18 @@ def recover_parked_mods(minecraft_dir: Path) -> None:
         disabled.rmdir()
 
 
-def mise_where(tool: str) -> str:
-    return subprocess.run(["mise", "where", tool], check=True, capture_output=True, text=True).stdout.strip()
+def java_home(tool: str) -> str:
+    """JAVA_HOME of a mise Java install: `mise where`, or its Contents/Home on macOS (where the install is a bundle)."""
+    home = Path(subprocess.run(["mise", "where", tool], check=True, capture_output=True, text=True).stdout.strip())
+    return str(home / "Contents" / "Home" if (home / "Contents" / "Home").is_dir() else home)
 
 
 def build_exporter_mod() -> Path:
     project = exporter_repo()
-    homes = ",".join(f"{mise_where(t)}/Contents/Home" for t in (ZULU8_TOOL, JAVA_TOOL))
+    if shutil.which("mise") is None:
+        raise CliError("building the exporter mod needs mise and its Java toolchains (the container); pass --mod-jar "
+                       "(gtnh-exporter/build/libs/bluemap-gtnh-exporter-<version>.jar)")
+    homes = ",".join(java_home(t) for t in (ZULU8_TOOL, JAVA_TOOL))
     cmd = ["mise", "exec", JAVA_TOOL, "--", "./gradlew", f"-Porg.gradle.java.installations.paths={homes}", "build"]
     print(f"[export] building exporter mod: {subprocess.list2cmdline(cmd)} (cwd {project})", flush=True)
     if subprocess.run(cmd, cwd=project).returncode != 0:
@@ -307,7 +320,7 @@ def cmd_export(args: argparse.Namespace) -> int:
     if extra_files:
         merged = out / "extra-states.merged.txt" if len(extra_files) > 1 else extra_files[0]
         if len(extra_files) > 1:
-            merged.write_text("".join(f.read_text() for f in extra_files))
+            merged.write_text("".join(f.read_text(encoding="utf-8") for f in extra_files), encoding="utf-8", newline="\n")
         jvm_args.append(f"-Dbluemap.gtnh.exporter.extraStates={merged}")
     code = run_client(
         layout, zip_path=default_zip(args.gtnh_pack), mods=[mod_jar], jvm_args=jvm_args, xmx="10G", timeout=1800,
@@ -335,7 +348,10 @@ def cmd_export(args: argparse.Namespace) -> int:
     return 0
 
 
-DEFAULT_PARALLEL = 1  # N > 1 works but is flaky (see the README); measured: N=4 116 s vs N=1 138 s for 7 scenes
+# Measured on Linux (32 cores, llvmpipe, 8 scenes / 81 cameras): N=1 300 s of client time, N=3 (--xmx 6G) 192 s; the
+# largest scene alone (endgame, 118 s after a 70 s boot) bounds any larger N.
+DEFAULT_PARALLEL = 3
+LWJGL_EXTRACT_PATH = "org.lwjgl.system.SharedLibraryExtractPath"  # LWJGL 3 Configuration.SHARED_LIBRARY_EXTRACT_PATH
 
 
 @dataclass
@@ -367,7 +383,9 @@ def run_workers(
     """Runs one client per worker at the same time ([client_session] for each, `settings(minecraft_dir)` around each
     run if given) and waits for all of them. Console lines are prefixed with `[w<i>]` when there is more than one
     worker; each worker's full log is `<worker>/logs-launcher/<kind>-<timestamp>.log`. Records each exit code and the
-    peak resident memory of each client's process group."""
+    peak resident memory of each client's process group. Each worker extracts LWJGL's natives into its own
+    `<worker>/lwjgl-natives/`: with the shared default (`<tmp>/lwjgl_<user>/`) clients that start together race on the
+    extraction and fail with `UnsatisfiedLinkError: Failed to locate library: libSDL3.so` (or `liblwjgl_opengl.so`)."""
     with terminate_as_interrupt(), contextlib.ExitStack() as stack:
         commands = []
         for run in runs:
@@ -375,7 +393,8 @@ def run_workers(
                 run.layout, zip_path=zip_path, mods=mods, extra_mods=extra_mods, resource_packs=resource_packs))
             if settings is not None:
                 stack.enter_context(settings(run.layout.minecraft_dir))
-            commands.append(build_command(run.layout, profile, xmx=xmx, jvm_args=run.jvm_args, username=username))
+            jvm_args = [f"-D{LWJGL_EXTRACT_PATH}={run.layout.instance_dir / 'lwjgl-natives'}", *run.jvm_args]
+            commands.append(build_command(run.layout, profile, xmx=xmx, jvm_args=jvm_args, username=username))
             run.log = default_log(run.layout, kind)
             print(f"[run] worker {run.index} log: {run.log}", flush=True)
         stack.enter_context(keep_awake(timeout))
@@ -383,12 +402,13 @@ def run_workers(
         try:
             for run, cmd in zip(runs, commands):
                 prefix = f"[w{run.index}] " if len(runs) > 1 else ""
-                procs.append(ClientProcess(cmd, cwd=run.layout.minecraft_dir, log_file=run.log, prefix=prefix))
+                env = stack.enter_context(virtual_display(run.log.with_suffix(".xvfb.log")))
+                procs.append(ClientProcess(cmd, cwd=run.layout.minecraft_dir, log_file=run.log, prefix=prefix, env=env))
 
             def sample() -> None:
-                rss = group_rss_kib()
+                rss = tree_rss_kib([proc.pid for proc in procs])
                 for run, proc in zip(runs, procs):
-                    run.rss_peak_kib = max(run.rss_peak_kib, rss.get(proc.pgid, 0))
+                    run.rss_peak_kib = max(run.rss_peak_kib, rss.get(proc.pid, 0))
 
             codes = run_processes(procs, timeout=timeout, sample=sample)
         except BaseException:
@@ -479,7 +499,9 @@ def cmd_cameras(args: argparse.Namespace) -> int:
                                    "wallSeconds": round(t_run - t_setup, 1)}
             session_file.write_text(json.dumps(session, indent=1) + "\n", encoding="utf-8")
         boot = f"boot {session['bootSeconds']:.0f}s" if session else "no session report"
-        print(f"[cameras] worker {run.index}: exit {run.code}, {boot}, peak RSS {run.rss_peak_kib / 1024 / 1024:.1f} GiB, "
+        session_error = session.get("error") if session else None
+        error = f", session error: {session_error}" if session_error else ""
+        print(f"[cameras] worker {run.index}: exit {run.code}, {boot}{error}, peak RSS {run.rss_peak_kib / 1024 / 1024:.1f} GiB, "
               f"log {run.log}")
         for job in run.jobs:
             report = _read_fresh(job.out / cameras.REPORT, started_wall) or {}
@@ -493,7 +515,7 @@ def cmd_cameras(args: argparse.Namespace) -> int:
                 )
                 print(f"[cameras]     {result['name']}: {state}{flags} ({result.get('seconds', 0):.1f}s, "
                       f"{result.get('fps', 0):.0f} fps)")
-            problems = cameras.check_outputs(job.out, job.cameras, started_wall)
+            problems = cameras.check_outputs(job.out, job.cameras, started_wall, session_error)
             if problems:
                 failed.append(job.scene)
                 print(f"[cameras]   {job.scene} FAILED: {'; '.join(problems[:5])}", file=sys.stderr)
@@ -557,7 +579,7 @@ def cmd_states(args: argparse.Namespace) -> int:
         for i, shard in enumerate(states.shard_lines(states_file.read_text(encoding="utf-8"), args.parallel), 1):
             layout, _ = workers.sync_worker(base, i)
             shard_file = layout.instance_dir / "states-shard.txt"
-            shard_file.write_text("".join(shard), encoding="utf-8")
+            shard_file.write_text("".join(shard), encoding="utf-8", newline="\n")
             index = layout.instance_dir / "states-index.json"
             index.unlink(missing_ok=True)
             indexes.append(index)
@@ -661,7 +683,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this run only; repeatable")
     p.add_argument("--mod-jar", type=Path, help="use this exporter jar instead of building it with gradle")
     p.add_argument("--bmh-jar", type=Path, help="harness mod jar loaded into the clients (default: the newest bmh-*.jar in WS/servers/gtnh-<version>/mods)")
-    p.add_argument("--xmx", default="10G", help="client heap size (default %(default)s)")
+    p.add_argument("--xmx", default="6G", help="heap size of each client (default %(default)s: about 9 GiB resident each, so 3 workers fit in 62 GB with room to spare)")
     p.add_argument("--timeout", type=float, default=3600, help="kill the clients after this many seconds, exit 124 (default %(default)s)")
     p.set_defaults(func=cmd_cameras)
 
@@ -675,7 +697,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--extra-mod", type=Path, action="append", default=[], help="extra client mod jar installed for this run only; repeatable")
     p.add_argument("--mod-jar", type=Path, help="use this exporter jar instead of building it with gradle")
     p.add_argument("--parallel", type=int, default=1, help="worker clients (WS/clients/<client>-worker-<i>) each drawing a contiguous shard (default %(default)s: the client itself)")
-    p.add_argument("--xmx", default="10G", help="client heap size (default %(default)s)")
+    p.add_argument("--xmx", default="10G", help="heap size of each client (default %(default)s; use 6G with --parallel)")
     p.add_argument("--timeout", type=float, default=3600, help="kill the client after this many seconds, exit 124 (default %(default)s)")
     p.add_argument("--log", type=Path, help="client log file with --parallel 1 (default <client-dir>/logs-launcher/client-<timestamp>.log)")
     p.set_defaults(func=cmd_states)
@@ -697,6 +719,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--shots", type=Path, help="screenshot dir (default WS/out/exporter[-<version>]/screens)")
     p.add_argument("--view", action="append", default=[], metavar="NAME=HASH", help="view as name=<webapp url hash>; repeatable (default: a few zoo overviews)")
     p.set_defaults(func=cmd_screens)
+
+    p = add_parser("serve", help="run client commands for callers that forward them (BMGTNH_CLIENT_HOST, the dev "
+                                 "container) on this host; listens on 127.0.0.1 only")
+    p.add_argument("--port", type=int, default=bridge.DEFAULT_PORT, help="port (default %(default)s)")
+    p.add_argument("--log", type=Path, help="server log, appended to (default WS/out/gtnh-client-serve.log)")
+    p.set_defaults(func=cmd_serve)
     return parser
 
 
@@ -828,19 +856,48 @@ def resolve_pack(args: argparse.Namespace) -> None:
             args.shots = args.shots or exporter / "screens"
 
 
-# Commands that launch clients: each holds the workspace's client lock (gtnh_client.lock) for its whole run.
-CLIENT_COMMANDS = frozenset({"run", "play", "export", "cameras", "states"})
+# Commands that prepare or launch clients: each holds the workspace's client lock (gtnh_client.lock) for its whole run
+# (`prepare` rewrites the natives a running client has loaded, which Windows does not allow).
+CLIENT_COMMANDS = frozenset({"prepare", "run", "play", "export", "cameras", "states"})
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    log_file = (args.log or workspace() / "out" / "gtnh-client-serve.log").resolve()
+    return bridge.serve(args.port, workspace().resolve(), log_file)
+
+
+def forward(args: argparse.Namespace, argv: list[str]) -> int:
+    """Runs a client command on the host of $BMGTNH_CLIENT_HOST (gtnh_client.bridge). What needs this machine is done
+    here first: the exporter mod build when there is no --mod-jar, and the default --bmh-jar of `cameras` (the scene
+    server's, in a container volume: the bridge sends it along)."""
+    argv = list(argv)
+    if args.command in ("export", "cameras", "states") and args.mod_jar is None:
+        args.mod_jar = build_exporter_mod()
+        argv += ["--mod-jar", str(args.mod_jar)]
+    if args.command == "cameras" and args.bmh_jar is None:
+        args.bmh_jar = default_bmh_jar(args.gtnh_pack)
+        argv += ["--bmh-jar", str(args.bmh_jar)]
+    paths = [(f"--{name.replace('_', '-')}", item) for name, value in vars(args).items()
+             for item in (value if isinstance(value, list) else [value]) if isinstance(item, Path)]
+    return bridge.forward(os.environ[bridge.HOST_ENV], argv, root=PurePosixPath(workspace().resolve().as_posix()),
+                          cwd=PurePosixPath(Path.cwd().as_posix()), paths=paths,
+                          jobs_file=args.jobs if args.command == "cameras" else None)
 
 
 def main(argv: list[str] | None = None) -> None:
-    args = build_parser().parse_args(_join_dash_values(sys.argv[1:] if argv is None else argv))
+    raw = sys.argv[1:] if argv is None else argv
+    args = build_parser().parse_args(_join_dash_values(raw))
     try:
+        if os.environ.get(bridge.STOP_ENV):
+            bridge.stop_on_eof()
         resolve_pack(args)
+        if args.command in bridge.FORWARDED and os.environ.get(bridge.HOST_ENV):
+            sys.exit(forward(args, raw))
         held = lock.client_lock(workspace()) if args.command in CLIENT_COMMANDS else contextlib.nullcontext()
         with held:
             code = args.func(args)
         sys.exit(code)
     except (CliError, cameras.CamerasError, states.StatesError, PrepareError, ProfileError, DownloadError, lock.LockBusy,
-            FileNotFoundError, subprocess.CalledProcessError) as e:  # fmt: skip
+            LaunchError, PathMapError, bridge.BridgeError, FileNotFoundError, subprocess.CalledProcessError) as e:  # fmt: skip
         print(f"gtnh-client: error: {e}", file=sys.stderr)
         sys.exit(1)

@@ -12,8 +12,10 @@ BLOCKS_NDJSON = "gtnh/blocks.ndjson"
 FLATTENING_TSV = "legacy/src/main/resources/de/bluecolored/bluemap/gtnh/legacy/flattening_1_7_10.tsv"
 INDEX = "index.json"
 # Version of the per-state capture (the mod's StateCapture and its settings): bump it whenever it can change the
-# outputs. The e2e reference cache reads this literal (with `ast`) into its keys.
-STATES_CAPTURE_VERSION = 1
+# outputs. The e2e reference cache reads this literal (with `ast`) into its keys. 2: references come from the Windows
+# host's native NVIDIA OpenGL through the bridge, not Mesa llvmpipe in the container (7.4 % of the colour images have
+# pixels more than 8 off).
+STATES_CAPTURE_VERSION = 2
 # StateCapture draws this many states per framebuffer batch; shards start on a batch boundary, so every state is drawn
 # in the same batch as in a single-client run.
 BATCH = 64
@@ -65,7 +67,7 @@ def write_states(pack: Path, flattening_tsv: Path, out: Path, only: str | None =
             continue
         lines.append(f"{name} {meta}\n")
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text("".join(lines), encoding="utf-8")
+    out.write_text("".join(lines), encoding="utf-8", newline="\n")  # LF on Windows too: e2e compares the list
     return len(lines)
 
 
@@ -99,7 +101,7 @@ def merge_indexes(shards: list[Path], out: Path, started_wall: float) -> None:
             merged["seconds"] = max(merged.get("seconds", 0), index.get("seconds", 0))
     assert merged is not None
     partial = out.with_name(out.name + ".part")
-    partial.write_text(json.dumps(merged, indent=1) + "\n", encoding="utf-8")
+    partial.write_text(json.dumps(merged, indent=1) + "\n", encoding="utf-8", newline="\n")
     partial.replace(out)
 
 

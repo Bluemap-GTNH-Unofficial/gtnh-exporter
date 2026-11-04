@@ -21,8 +21,11 @@ from gtnh_client.workers import clone
 # Version of the capture conditions: bump it whenever anything that can change the client's pixels, depth or matrices
 # changes (CAPTURE_OPTIONS, ANGELICA_OPTIONS, SPEC_DEFAULTS, VIEW_DISTANCE, the mod's CameraCapture, the single-player
 # path). The e2e reference cache reads this literal (with `ast`) into its keys; every cameras-report.json carries it.
-# 1: dedicated server + RCON; 2: single-player worlds, frozen game while frames are compared.
-CAPTURE_VERSION = 2
+# 1: dedicated server + RCON; 2: single-player worlds, frozen game while frames are compared; 3: ANGELICA_OPTIONS also
+# written for clients without config/angelica-options.json (before, Angelica's RGSS/linear defaults blurred them);
+# 4: references come from the Windows host's native NVIDIA OpenGL through the bridge (gtnh_client.bridge), not from
+# Mesa llvmpipe in the container (camera views differ in 0.1-0.7 % of the pixels by more than 8).
+CAPTURE_VERSION = 4
 CAMERAS_FORMAT = 1
 CAMERA_KEYS = ("name", "eye", "yaw", "pitch", "fov", "width", "height")
 USERNAME = "BlueMapCamera"
@@ -179,8 +182,8 @@ def save_name(index: int, job: Job) -> str:
 
 
 def prepare_saves(minecraft_dir: Path, jobs: list[Job]) -> list[str]:
-    """Copies each job's world snapshot into `saves/` (APFS clones; the snapshots are never touched) after removing
-    the saves an earlier run left behind. Returns the save names in job order."""
+    """Copies each job's world snapshot into `saves/` (APFS clones on macOS, plain copies elsewhere; the snapshots are
+    never touched) after removing the saves an earlier run left behind. Returns the save names in job order."""
     saves = minecraft_dir / "saves"
     remove_saves(minecraft_dir)
     saves.mkdir(parents=True, exist_ok=True)
@@ -248,15 +251,17 @@ def set_angelica_options(data: dict, values: dict[tuple[str, str], object]) -> d
 @contextlib.contextmanager
 def capture_settings(minecraft_dir: Path):
     """Writes the capture settings into `options.txt` and `config/angelica-options.json` for one run and restores both
-    files (or removes them if they did not exist) afterwards, also on errors and interrupts."""
+    files (or removes them if they did not exist) afterwards, also on errors and interrupts. A client that has never
+    written its Angelica options (a freshly prepared one) gets a file with just ANGELICA_OPTIONS, which Angelica
+    completes with its defaults; without it Angelica would sample textures with its RGSS/linear defaults."""
     files = [minecraft_dir / "options.txt", minecraft_dir / "config" / "angelica-options.json"]
     saved = {path: path.read_bytes() if path.is_file() else None for path in files}
     try:
         options, angelica = files
         options.write_text(set_options(options.read_text() if options.is_file() else "", CAPTURE_OPTIONS))
-        if angelica.is_file():
-            data = json.loads(angelica.read_text(encoding="utf-8"))
-            angelica.write_text(json.dumps(set_angelica_options(data, ANGELICA_OPTIONS), indent=2) + "\n")
+        data = json.loads(angelica.read_text(encoding="utf-8")) if angelica.is_file() else {}
+        angelica.parent.mkdir(parents=True, exist_ok=True)
+        angelica.write_text(json.dumps(set_angelica_options(data, ANGELICA_OPTIONS), indent=2) + "\n")
         print(f"[cameras] capture settings in {options} and {angelica} (restored afterwards)", flush=True)
         yield
     finally:
@@ -267,11 +272,14 @@ def capture_settings(minecraft_dir: Path):
                 path.write_bytes(content)
 
 
-def check_outputs(out: Path, cameras: dict, started_wall: float) -> list[str]:
-    """Problems with the outputs of a finished job (missing, stale or failed); empty when every camera was captured."""
+def check_outputs(out: Path, cameras: dict, started_wall: float, session_error: str | None = None) -> list[str]:
+    """Problems with the outputs of a finished job (missing, stale or failed); empty when every camera was captured.
+    `session_error`: the error of the client session that ran the job (its `cameras-session.json`), which explains a
+    missing report (e.g. the capture's watchdog killed the stuck client)."""
     report = out / REPORT
     if not report.is_file() or report.stat().st_mtime < started_wall:
-        return [f"{report} missing or older than this run"]
+        why = f"; client session error: {session_error}" if session_error else ""
+        return [f"{report} missing or older than this run{why}"]
     problems = []
     data = json.loads(report.read_text(encoding="utf-8"))
     if data.get("error"):

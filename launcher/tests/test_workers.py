@@ -29,7 +29,7 @@ def test_worker_layout_shares_the_pack_and_owns_its_game_dir(tmp_path: Path):
 def _tree(root: Path) -> dict[str, bytes | str]:
     result = {}
     for path in sorted(root.rglob("*")):
-        key = str(path.relative_to(root))
+        key = path.relative_to(root).as_posix()
         if path.is_symlink():
             result[key] = "-> " + os.readlink(path)
         elif path.is_file():

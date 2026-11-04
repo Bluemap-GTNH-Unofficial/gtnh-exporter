@@ -44,7 +44,9 @@ def test_busy_lock_names_the_holder(tmp_path):
     finally:
         proc.kill()
         proc.wait()
-    with lock.client_lock(tmp_path, "after a killed holder", wait=0) as path:  # the kernel released it
+    # the kernel releases a dead holder's lock; on Windows (msvcrt.locking / LockFileEx) only shortly after the process
+    # exits, so allow a brief wait (wait=0 failed 1 run in ~10 on the Windows host, 2026-11-03)
+    with lock.client_lock(tmp_path, "after a killed holder", wait=10) as path:
         assert lock.read_holder(path)["command"] == "after a killed holder"
 
 

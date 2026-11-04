@@ -196,7 +196,7 @@ def write_extra_states(dumps: list[Path], file: Path) -> int:
     states: set[tuple[str, int]] = set()
     for dump in dumps:
         states.update(placed_states(dump))
-    file.write_text("".join(f"{name} {meta}\n" for name, meta in sorted(states)))
+    file.write_text("".join(f"{name} {meta}\n" for name, meta in sorted(states)), encoding="utf-8", newline="\n")
     return len(states)
 
 

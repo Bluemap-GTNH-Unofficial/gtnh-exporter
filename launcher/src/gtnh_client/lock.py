@@ -1,16 +1,16 @@
 """The workspace's client lock: only one set of GTNH clients runs on the machine at a time.
 
-`WS/locks/client.lock` is held with `flock` (released by the kernel when the holder exits, also on a crash) for the
-whole of every client-launching command (`run`, `play`, `export`, `cameras`, `states`; one hold for all workers of a
-`--parallel` run). The holder writes who it is into the file (pid, command, start time, cwd); a command that finds the
-lock taken prints that and waits until it is free. `BMGTNH_CLIENT_LOCK_WAIT=<seconds>` bounds the wait (`0`: fail at
-once instead of queueing).
+`WS/locks/client.lock` is held with `flock` (on Windows a byte-range lock, `msvcrt.locking`, on a byte far beyond the
+holder record; both are released by the OS when the holder exits, also on a crash) for the whole of every command
+that prepares or launches clients (`prepare`, `run`, `play`, `export`, `cameras`, `states`; one hold for all workers of
+a `--parallel` run). The holder writes who it is into the file (pid, command, start time, cwd); a command that finds
+the lock taken prints that and waits until it is free. `BMGTNH_CLIENT_LOCK_WAIT=<seconds>` bounds the wait (`0`: fail
+at once instead of queueing).
 """
 
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import json
 import os
 import socket
@@ -18,12 +18,43 @@ import sys
 import time
 from pathlib import Path
 
+if sys.platform == "win32":
+    import msvcrt
+else:
+    import fcntl
+
 LOCK_DIR = "locks"
 CLIENT_LOCK = "client.lock"
 WAIT_ENV = "BMGTNH_CLIENT_LOCK_WAIT"
 POLL_SECONDS = 1.0
+# Windows: the locked byte. Others cannot read a locked range, so it lies beyond any holder record.
+LOCK_OFFSET = 1 << 20
 
 _held: dict[Path, int] = {}  # lock path -> nesting depth of this process's hold
+
+
+def _try_lock(fd: int) -> bool:
+    """Takes the lock without waiting; False if another process holds it."""
+    if sys.platform == "win32":
+        os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError:
+            return False
+        return True
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _unlock(fd: int) -> None:
+    if sys.platform == "win32":
+        os.lseek(fd, LOCK_OFFSET, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class LockBusy(Exception):
@@ -71,36 +102,35 @@ def client_lock(ws: Path, describe: str | None = None, *, wait: float | None = N
             _held[path] -= 1
         return
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o644)
     try:
         limit = _wait_limit(wait)
         started = time.monotonic()
         reported = None
         while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if _try_lock(fd):
                 break
-            except BlockingIOError:
-                holder = describe_holder(read_holder(path))
-                if limit is not None and time.monotonic() - started >= limit:
-                    raise LockBusy(f"client lock {path} is held by {holder}") from None
-                if holder != reported:
-                    print(f"[lock] client lock {path} is held by {holder}; waiting", file=sys.stderr, flush=True)
-                    reported = holder
-                time.sleep(POLL_SECONDS if limit is None else min(POLL_SECONDS, max(0.0, limit - (time.monotonic() - started))))
+            holder = describe_holder(read_holder(path))
+            if limit is not None and time.monotonic() - started >= limit:
+                raise LockBusy(f"client lock {path} is held by {holder}") from None
+            if holder != reported:
+                print(f"[lock] client lock {path} is held by {holder}; waiting", file=sys.stderr, flush=True)
+                reported = holder
+            time.sleep(POLL_SECONDS if limit is None else min(POLL_SECONDS, max(0.0, limit - (time.monotonic() - started))))
         if reported is not None:
             print(f"[lock] client lock acquired after {time.monotonic() - started:.0f}s", file=sys.stderr, flush=True)
         record = {"pid": os.getpid(), "host": socket.gethostname(),
                   "command": describe or " ".join([Path(sys.argv[0]).name, *sys.argv[1:]]),
                   "started": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "cwd": os.getcwd()}
         os.ftruncate(fd, 0)
-        os.pwrite(fd, (json.dumps(record) + "\n").encode("utf-8"), 0)
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.write(fd, (json.dumps(record) + "\n").encode("utf-8"))
         _held[path] = 1
         try:
             yield path
         finally:
             del _held[path]
             os.ftruncate(fd, 0)  # free: no stale holder record for the next waiter
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _unlock(fd)
     finally:
         os.close(fd)

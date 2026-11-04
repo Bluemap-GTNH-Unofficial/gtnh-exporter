@@ -10,10 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from gtnh_client.download import Fetch, FetchStats, fetch_all
-from gtnh_client.profile import Profile, artifact_file, build_profile, load_components
+from gtnh_client.profile import Profile, RuntimeContext, artifact_file, build_profile, load_components
 
 ASSET_OBJECTS_URL = "https://resources.download.minecraft.net"
 _UNPACK_MARKER = ".gtnh-client-unpacked.json"
+# In natives/: the platform (RuntimeContext classifier) the natives were extracted for. A client directory used from
+# the container and from the Windows host gets the natives of whichever runs it.
+_NATIVES_MARKER = ".gtnh-client-natives.json"
 
 
 class PrepareError(Exception):
@@ -57,7 +60,14 @@ class Layout:
         return self.cache_dir / "assets"
 
     def load_profile(self) -> Profile:
-        return build_profile(load_components(self.client_dir))
+        return build_profile(load_components(self.client_dir), RuntimeContext.host())
+
+    def natives_platform(self) -> str | None:
+        """The platform of the extracted natives (see _NATIVES_MARKER), None if there are none or they predate it."""
+        try:
+            return json.loads((self.natives_dir / _NATIVES_MARKER).read_text(encoding="utf-8")).get("platform")
+        except (OSError, ValueError):
+            return None
 
 
 def _zip_identity(zip_path: Path) -> dict:
@@ -121,6 +131,8 @@ def _library_fetches(layout: Layout, profile: Profile) -> list[Fetch]:
 
 
 def extract_natives(layout: Layout, profile: Profile) -> int:
+    """Extracts the profile's native jars (the host's, see [Layout.load_profile]) into `natives/` and records the
+    platform."""
     shutil.rmtree(layout.natives_dir, ignore_errors=True)
     layout.natives_dir.mkdir(parents=True)
     count = 0
@@ -135,6 +147,7 @@ def extract_natives(layout: Layout, profile: Profile) -> int:
                 with zf.open(info) as src, target.open("wb") as out:
                     shutil.copyfileobj(src, out)
                 count += 1
+    (layout.natives_dir / _NATIVES_MARKER).write_text(json.dumps({"platform": RuntimeContext.host().classifier}))
     return count
 
 
@@ -185,5 +198,7 @@ def ensure_downloads(layout: Layout, profile: Profile) -> None:
     if objects:
         print(f"[run] fetching {len(objects)} missing asset objects")
         fetch_all(objects)
-    if profile.natives and not layout.natives_dir.is_dir():
+    if profile.natives and layout.natives_platform() != RuntimeContext.host().classifier:
+        print(f"[run] extracting the natives for {RuntimeContext.host().classifier} (were: "
+              f"{layout.natives_platform() or 'none recorded'})")
         extract_natives(layout, profile)

@@ -9,7 +9,9 @@ classpath order (libraries in component order, main jar last).
 from __future__ import annotations
 
 import json
+import platform
 import re
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,8 +34,8 @@ class ProfileError(Exception):
 class RuntimeContext:
     """Prism's RuntimeContext: `system` is the Mojang OS name, `arch` the mapped Java arch."""
 
-    system: str = "osx"
-    arch: str = "arm64"
+    system: str
+    arch: str
 
     @property
     def classifier(self) -> str:
@@ -47,8 +49,17 @@ class RuntimeContext:
         # Precise "[os]-[arch]" always; bare "[os]" only on the legacy (x86) architectures.
         return target == self.classifier or (self.legacy_arch and target == self.system)
 
+    @classmethod
+    def host(cls) -> RuntimeContext:
+        """This machine, named as Prism does (RuntimeContext::currentSystem, mappedJavaArchitecture)."""
+        system = {"darwin": "osx", "win32": "windows"}.get(sys.platform, sys.platform)
+        machine = platform.machine().lower()
+        arch = {"amd64": "x86_64", "aarch64": "arm64", "i386": "x86", "i686": "x86"}.get(machine, machine)
+        return cls(system, arch)
+
 
 MACOS_ARM64 = RuntimeContext("osx", "arm64")
+LINUX_X86_64 = RuntimeContext("linux", "x86_64")
 
 
 def rules_allow(rules: list[dict] | None, ctx: RuntimeContext) -> bool:
@@ -178,8 +189,8 @@ def _apply_library(target: list[Library], lib: Library) -> None:
     target.append(lib)
 
 
-def build_profile(components: list[dict], ctx: RuntimeContext = MACOS_ARM64) -> Profile:
-    """Apply component JSONs in order (Prism VersionFile::applyTo)."""
+def build_profile(components: list[dict], ctx: RuntimeContext) -> Profile:
+    """Apply component JSONs in order (Prism VersionFile::applyTo) for the libraries and natives active on `ctx`."""
     profile = Profile()
     for comp in components:
         unknown = set(comp) - _IGNORED_KEYS - _HANDLED_KEYS

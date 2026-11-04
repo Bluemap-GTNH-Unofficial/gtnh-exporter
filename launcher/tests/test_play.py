@@ -5,10 +5,17 @@ import subprocess
 import sys
 import threading
 import time
+import zipfile
 from pathlib import Path
 
+import pytest
+
 from gtnh_client.cli import recover_parked_mods
+from gtnh_client.launch import EXPORTER_MOD_CLASS, install_mods
 from gtnh_client.proxy import DelayProxy
+
+# fake tools written as sh scripts, POSIX signals (Windows: tests/test_process.py)
+posix_only = pytest.mark.skipif(sys.platform == "win32", reason="POSIX sh scripts and signals")
 
 
 def test_delay_proxy_holds_first_server_reply_then_streams():
@@ -50,6 +57,25 @@ def test_recover_parked_mods(tmp_path: Path):
     assert not (tmp_path / "mods-disabled").exists()
 
 
+def _jar(path: Path, *entries: str) -> Path:
+    with zipfile.ZipFile(path, "w") as z:
+        for entry in entries:
+            z.writestr(entry, "x")
+    return path
+
+
+def test_install_mods_replaces_exporter_jars_whatever_their_names(tmp_path: Path):
+    mods = tmp_path / "game" / "mods"
+    mods.mkdir(parents=True)
+    _jar(mods / "bluemap-gtnh-exporter-0.2.0.jar", EXPORTER_MOD_CLASS)
+    _jar(mods / "exporter-test.jar", EXPORTER_MOD_CLASS)
+    _jar(mods / "other.jar", "a/B.class")
+    new = _jar(tmp_path / "c.jar", EXPORTER_MOD_CLASS, "new")
+    install_mods(tmp_path / "game", [new, _jar(tmp_path / "bmh-0.3.0.jar", "bmh/Mod.class")])
+    assert sorted(p.name for p in mods.iterdir()) == ["bmh-0.3.0.jar", "c.jar", "other.jar"]
+    assert "new" in zipfile.ZipFile(mods / "c.jar").namelist()
+
+
 SCRIPT = """
 import signal, sys, pathlib
 from gtnh_client.cli import _interrupt
@@ -60,10 +86,14 @@ print("exit", code, flush=True)
 """
 
 
+@posix_only
 def test_sigterm_kills_client_tree_and_returns(tmp_path: Path):
     proc = subprocess.Popen([sys.executable, "-c", SCRIPT, str(tmp_path / "c.log")], stdout=subprocess.PIPE, text=True)
-    time.sleep(1.5)
-    child = subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True).stdout.split()
+    child: list[str] = []
+    deadline = time.monotonic() + 15  # the interpreter's imports take seconds on a loaded machine
+    while not child and time.monotonic() < deadline:
+        time.sleep(0.2)
+        child = subprocess.run(["pgrep", "-P", str(proc.pid)], capture_output=True, text=True).stdout.split()
     assert child, "sleep child not started"
     proc.send_signal(signal.SIGTERM)
     out, _ = proc.communicate(timeout=30)
@@ -108,6 +138,7 @@ def _wait_for(path: Path) -> str:
     raise AssertionError(f"{path} not written")
 
 
+@posix_only
 def test_keep_awake_holds_caffeinate_for_the_block(tmp_path: Path, monkeypatch):
     from gtnh_client.launch import keep_awake
 
@@ -119,6 +150,7 @@ def test_keep_awake_holds_caffeinate_for_the_block(tmp_path: Path, monkeypatch):
     assert not _alive(int(pid))
 
 
+@posix_only
 def test_keep_awake_stops_caffeinate_on_interrupt(tmp_path: Path, monkeypatch):
     from gtnh_client.launch import keep_awake
 
@@ -138,3 +170,55 @@ def test_keep_awake_is_a_no_op_off_macos(monkeypatch):
     monkeypatch.setattr(sys, "platform", "linux")
     with keep_awake(10) as proc:
         assert proc is None
+
+
+def _fake_xvfb(tmp_path: Path, monkeypatch, body: str) -> Path:
+    """An `Xvfb` on PATH running `body` (sh; $2 is the -displayfd fd), with its pid recorded; no DISPLAY set."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    record = tmp_path / "xvfb.txt"
+    script = bin_dir / "Xvfb"
+    script.write_text(f'#!/bin/sh\necho "$$ $*" > {record}\necho "xvfb says hi" >&2\n{body}\n')
+    script.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.delenv("DISPLAY", raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    return record
+
+
+@posix_only
+def test_virtual_display_yields_the_servers_display_and_stops_it(tmp_path: Path, monkeypatch):
+    from gtnh_client.launch import virtual_display
+
+    record = _fake_xvfb(tmp_path, monkeypatch, 'echo 7 > /dev/fd/$2\nexec sleep 600')
+    log = tmp_path / "client.xvfb.log"
+    with virtual_display(log) as env:
+        assert env["DISPLAY"] == ":7"
+        pid, *args = _wait_for(record).split()
+        assert args[:2] == ["-displayfd", args[1]] and "-nolisten" in args
+        assert _alive(int(pid))
+    assert not _alive(int(pid))
+    assert "xvfb says hi" in log.read_text()
+
+
+@posix_only
+def test_virtual_display_fails_instead_of_waiting_for_a_server_that_never_gets_ready(tmp_path: Path, monkeypatch):
+    from gtnh_client import launch
+
+    record = _fake_xvfb(tmp_path, monkeypatch, "exec sleep 600")
+    monkeypatch.setattr(launch, "XVFB_READY_TIMEOUT", 1.0)
+    started = time.monotonic()
+    with pytest.raises(RuntimeError, match="not ready"):
+        with launch.virtual_display(tmp_path / "x.log"):
+            pass
+    assert time.monotonic() - started < 10
+    assert not _alive(int(_wait_for(record).split()[0]))
+
+
+def test_virtual_display_keeps_an_existing_display(monkeypatch):
+    from gtnh_client.launch import virtual_display
+
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setenv("DISPLAY", ":0")
+    with virtual_display(Path("/nonexistent/x.log")) as env:
+        assert env is None
